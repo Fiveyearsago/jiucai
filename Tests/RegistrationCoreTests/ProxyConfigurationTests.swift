@@ -2,10 +2,19 @@ import XCTest
 @testable import RegistrationCore
 
 final class ProxyConfigurationTests: XCTestCase {
+    func testObsoletePreflightSettingIsIgnoredAndRemovedOnSave() throws {
+        let original = ProxyConfiguration()
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as? [String: Any])
+        object["preflightTestLimitMilliseconds"] = "obsolete"
+        let decoded = try JSONDecoder().decode(ProxyConfiguration.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertEqual(decoded, original)
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(decoded)) as? [String: Any])
+        XCTAssertNil(saved["preflightTestLimitMilliseconds"])
+    }
+
     func testDefaultLatencyLimits() {
         let configuration = ProxyConfiguration()
         XCTAssertEqual(configuration.poolTestLimitMilliseconds, 3_000)
-        XCTAssertEqual(configuration.preflightTestLimitMilliseconds, 5_000)
         XCTAssertEqual(configuration.pageLoadingTimeoutSeconds, 10)
     }
 
@@ -28,7 +37,6 @@ final class ProxyConfigurationTests: XCTestCase {
         let store = JournalStore(directory: directory)
         var journal = Journal()
         journal.proxyConfiguration.poolTestLimitMilliseconds = 1_750
-        journal.proxyConfiguration.preflightTestLimitMilliseconds = 8_500
         journal.proxyConfiguration.pageLoadingTimeoutSeconds = 17
         journal.proxyConfiguration.entries = [ProxyEntry(host: "saved.invalid", port: 1080)]
         try store.save(journal)
@@ -42,9 +50,6 @@ final class ProxyConfigurationTests: XCTestCase {
             configuration.poolTestLimitMilliseconds = invalid
             XCTAssertThrowsError(try configuration.validateLatencyLimits())
             configuration.poolTestLimitMilliseconds = 3_000
-            configuration.preflightTestLimitMilliseconds = invalid
-            XCTAssertThrowsError(try configuration.validateLatencyLimits())
-            configuration.preflightTestLimitMilliseconds = 5_000
             configuration.pageLoadingTimeoutSeconds = invalid
             XCTAssertThrowsError(try configuration.validateLatencyLimits())
         }

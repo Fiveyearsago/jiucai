@@ -25,6 +25,7 @@ final class ProxyManagerTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Cache-Control"), "no-cache, no-store")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Pragma"), "no-cache")
         XCTAssertEqual(request.timeoutInterval, 7.5)
+        XCTAssertEqual(request.networkServiceType, .background)
         XCTAssertNil(request.httpBody)
     }
 
@@ -80,6 +81,10 @@ final class ProxyManagerTests: XCTestCase {
         XCTAssertEqual(direct.configuration.requestCachePolicy, .reloadIgnoringLocalCacheData)
         XCTAssertEqual(direct.configuration.timeoutIntervalForRequest, 17)
         XCTAssertEqual(direct.configuration.timeoutIntervalForResource, 17)
+        XCTAssertEqual(direct.configuration.networkServiceType, .default)
+        let background = try XCTUnwrap(ProxyManager.session(through: nil, timeout: 3, background: true))
+        defer { background.invalidateAndCancel() }
+        XCTAssertEqual(background.configuration.networkServiceType, .background)
         guard #available(macOS 14.0, *) else { return }
         let proxied = try XCTUnwrap(ProxyManager.session(through: ProxyEntry(host: "proxy.invalid", port: 1080), timeout: 6))
         defer { proxied.invalidateAndCancel() }
@@ -106,35 +111,26 @@ final class ProxyManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testRegistrationRetryStartsAfterFailedProxyAndSkipsPreviouslyTriedProxies() async throws {
+    func testRegistrationRetryStartsAfterFailedProxyAndSkipsPreviouslyTriedProxies() throws {
         var configuration = ProxyConfiguration()
         configuration.enabled = true
         configuration.entries = (0..<4).map { ProxyEntry(host: "ordered\($0).invalid", port: 1080) }
         let entries = configuration.entries
-        var tested: [UUID] = []
-        let selection = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
-                                                           startingAfter: entries[1].id, excluding: [entries[2].id], test: { entry in
-            tested.append(entry.id)
-            return self.result(100)
-        }, discard: { _, _ in XCTFail("The candidate passed") })
-        XCTAssertEqual(selection?.entry.id, entries[3].id)
-        XCTAssertEqual(tested, [entries[3].id])
+        let selected = try ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
+                                                     startingAfter: entries[1].id, excluding: [entries[2].id])
+        XCTAssertEqual(selected?.id, entries[3].id)
     }
 
     @MainActor
-    func testRegistrationRetryStopsAfterEveryProxyHasFailed() async {
+    func testRegistrationRetryReportsExhaustionAfterEveryProxyHasFailed() {
         var configuration = ProxyConfiguration()
         configuration.enabled = true
         configuration.entries = (0..<2).map { ProxyEntry(host: "exhausted\($0).invalid", port: 1080) }
-        do {
-            _ = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
-                                                   startingAfter: configuration.entries.last?.id,
-                                                   excluding: Set(configuration.entries.map(\.id)), test: { _ in
-                XCTFail("Previously failed proxies must not be retested for this account")
-                return self.result(100)
-            }, discard: { _, _ in XCTFail("Nothing to discard") })
-            XCTFail("Every proxy has already failed")
-        } catch { XCTAssertTrue(error is ProxyManager.SelectionError) }
+        XCTAssertThrowsError(try ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
+                                                          startingAfter: configuration.entries.last?.id,
+                                                          excluding: Set(configuration.entries.map(\.id)))) {
+            XCTAssertTrue($0 is ProxyManager.SelectionError)
+        }
     }
 
     func testPoolTestingRemovesOnlyProxiesAboveThreeSecondsByDefault() {
@@ -144,10 +140,7 @@ final class ProxyManagerTests: XCTestCase {
             var configuration = ProxyConfiguration()
             configuration.enabled = true
             configuration.entries = [entry, other]
-
-            let discarded = ProxyManager.discardIfNeeded(entry, result: result(milliseconds),
-                                                        purpose: .pool, configuration: &configuration)
-
+            let discarded = ProxyManager.discardIfNeeded(entry, result: result(milliseconds), configuration: &configuration)
             XCTAssertEqual(discarded, milliseconds > 3_000)
             XCTAssertEqual(configuration.entries, milliseconds > 3_000 ? [other] : [entry, other])
             XCTAssertTrue(configuration.enabled)
@@ -161,52 +154,30 @@ final class ProxyManagerTests: XCTestCase {
                 var configuration = ProxyConfiguration()
                 configuration.poolTestLimitMilliseconds = limit
                 configuration.entries = [entry]
-
-                XCTAssertEqual(ProxyManager.TestPurpose.pool.timeout(in: configuration), Double(limit) / 1_000, accuracy: 0.000_001)
-                XCTAssertEqual(ProxyManager.discardIfNeeded(entry, result: result(milliseconds), purpose: .pool,
-                                                           configuration: &configuration), milliseconds > limit)
+                XCTAssertEqual(ProxyManager.poolTestTimeout(in: configuration), Double(limit) / 1_000, accuracy: 0.000_001)
+                XCTAssertEqual(ProxyManager.discardIfNeeded(entry, result: result(milliseconds), configuration: &configuration), milliseconds > limit)
                 XCTAssertEqual(configuration.entries.isEmpty, milliseconds > limit)
             }
         }
     }
 
     @MainActor
-    func testPreflightUsesConfiguredThresholdForSelectionAndTimeout() async throws {
-        for limit in [2_500, 7_000] {
-            let slow = ProxyEntry(host: "custom-slow.invalid", port: 1080)
-            let fast = ProxyEntry(host: "custom-fast.invalid", port: 1080)
-            var configuration = ProxyConfiguration()
-            configuration.enabled = true
-            configuration.preflightTestLimitMilliseconds = limit
-            configuration.entries = [slow, fast]
-            var tested: [UUID] = []
-            XCTAssertEqual(ProxyManager.TestPurpose.beforeUse.timeout(in: configuration), Double(limit) / 1_000, accuracy: 0.000_001)
-
-            let selection = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0, test: { entry in
-                tested.append(entry.id)
-                return self.result(entry.id == slow.id ? limit : limit - 1)
-            }, discard: { entry, result in
-                XCTAssertTrue(ProxyManager.discardIfNeeded(entry, result: result, purpose: .beforeUse,
-                                                           configuration: &configuration))
-            })
-
-            XCTAssertEqual(tested, [slow.id, fast.id])
-            XCTAssertEqual(selection?.entry.id, fast.id)
-            XCTAssertEqual(configuration.entries, [fast])
-        }
+    func testSelectionDoesNotDependOnBatchThreshold() throws {
+        var configuration = ProxyConfiguration()
+        configuration.enabled = true
+        configuration.poolTestLimitMilliseconds = -1
+        configuration.entries = [ProxyEntry(host: "direct-selection.invalid", port: 1080)]
+        let selected = try ProxyManager.selectProxy(configuration: configuration, completedCount: 0)
+        XCTAssertEqual(selected, configuration.entries.first)
     }
 
     @MainActor
-    func testExhaustionMessageReportsConfiguredPreflightLimit() async {
+    func testExhaustionMessageExplainsHowToResume() {
         var configuration = ProxyConfiguration()
         configuration.enabled = true
-        configuration.preflightTestLimitMilliseconds = 2_500
-        do {
-            _ = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
-                                                   test: { _ in self.result(100) }, discard: { _, _ in })
-            XCTFail("An empty pool must stop registration")
-        } catch {
-            XCTAssertTrue(error.localizedDescription.contains("2500 ms"))
+        XCTAssertThrowsError(try ProxyManager.selectProxy(configuration: configuration, completedCount: 0)) {
+            XCTAssertTrue($0.localizedDescription.contains("补充代理后会自动继续"))
+            XCTAssertFalse($0.localizedDescription.contains("复测"))
         }
     }
 
@@ -215,134 +186,51 @@ final class ProxyManagerTests: XCTestCase {
             let entry = ProxyEntry(host: "unusable.invalid", port: 1080)
             var configuration = ProxyConfiguration()
             configuration.entries = [entry]
-
-            XCTAssertTrue(ProxyManager.discardIfNeeded(entry, result: result(100, verdict: verdict),
-                                                       purpose: .pool, configuration: &configuration))
+            XCTAssertTrue(ProxyManager.discardIfNeeded(entry, result: result(100, verdict: verdict), configuration: &configuration))
             XCTAssertTrue(configuration.entries.isEmpty)
         }
     }
 
     @MainActor
-    func testPreflightTriesImmediateSuccessorsAndWrapsAfterDiscardingSlowProxies() async throws {
+    func testSelectionUsesConfiguredAccountGroupAndSkipsDisabledProxies() throws {
         let first = ProxyEntry(host: "first.invalid", port: 1080)
         var disabled = ProxyEntry(host: "disabled.invalid", port: 1080)
         disabled.enabled = false
         let second = ProxyEntry(host: "second.invalid", port: 1080)
         let third = ProxyEntry(host: "third.invalid", port: 1080)
-        let fourth = ProxyEntry(host: "fourth.invalid", port: 1080)
         var configuration = ProxyConfiguration()
         configuration.enabled = true
         configuration.switchEvery = 2
-        configuration.entries = [first, disabled, second, third, fourth]
-        var tested: [UUID] = []
-
-        let selection = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 4, test: { entry in
-            tested.append(entry.id)
-            return self.result(entry.id == first.id ? 4_999 : (entry.id == third.id ? 7_000 : 5_000))
-        }, discard: { entry, result in
-            XCTAssertTrue(ProxyManager.discardIfNeeded(entry, result: result, purpose: .beforeUse,
-                                                       configuration: &configuration))
-        })
-
-        XCTAssertEqual(tested, [third.id, fourth.id, first.id])
-        XCTAssertEqual(selection?.entry.id, first.id)
-        XCTAssertEqual(selection?.result.milliseconds, 4_999)
-        XCTAssertEqual(configuration.entries, [first, disabled, second])
-    }
-
-    @MainActor
-    func testPreflightDiscardsUnreachableProxyAndUsesNextOne() async throws {
-        let unreachable = ProxyEntry(host: "unreachable.invalid", port: 1080)
-        let usable = ProxyEntry(host: "usable.invalid", port: 1080)
-        var configuration = ProxyConfiguration()
-        configuration.enabled = true
-        configuration.entries = [unreachable, usable]
-        var discarded: [UUID] = []
-
-        let selection = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0, test: { entry in
-            self.result(100, verdict: entry.id == unreachable.id ? .unreachable : .usable)
-        }, discard: { entry, _ in discarded.append(entry.id) })
-
-        XCTAssertEqual(discarded, [unreachable.id])
-        XCTAssertEqual(selection?.entry.id, usable.id)
-    }
-
-    @MainActor
-    func testPreflightStopsWhenAllProxiesFailWithoutFallingBackToDirectConnection() async {
-        var configuration = ProxyConfiguration()
-        configuration.enabled = true
-        configuration.entries = (1...3).map { ProxyEntry(host: "slow\($0).invalid", port: 1080) }
-        let expected = configuration.entries.map(\.id)
-        var tested: [UUID] = []
-        var discarded: [UUID] = []
-
-        do {
-            _ = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0, test: { entry in
-                tested.append(entry.id)
-                return self.result(5_001)
-            }, discard: { entry, _ in discarded.append(entry.id) })
-            XCTFail("An exhausted proxy pool must stop registration")
-        } catch {
-            XCTAssertTrue(error is ProxyManager.SelectionError)
+        configuration.entries = [first, disabled, second, third]
+        for (completed, expected) in [(0, first), (1, first), (2, second), (4, third), (6, first)] {
+            let selected = try ProxyManager.selectProxy(configuration: configuration, completedCount: completed)
+            XCTAssertEqual(selected, expected)
         }
-
-        XCTAssertEqual(tested, expected)
-        XCTAssertEqual(discarded, expected)
+        XCTAssertEqual(configuration.entries, [first, disabled, second, third])
     }
 
     @MainActor
-    func testEmptyEnabledPoolStopsButDisabledPoolAllowsDirectConnection() async throws {
+    func testEmptyEnabledPoolWaitsButDisabledPoolAllowsDirectConnection() throws {
         var configuration = ProxyConfiguration()
-        let test: (ProxyEntry) async throws -> ProxyManager.TestResult = { _ in
-            XCTFail("There is no proxy to test")
-            return self.result(100)
-        }
-        let direct = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
-                                                        test: test, discard: { _, _ in XCTFail("Nothing to discard") })
-        XCTAssertNil(direct)
-
+        XCTAssertNil(try ProxyManager.selectProxy(configuration: configuration, completedCount: 0))
         for entries in [[], [ProxyEntry(host: "disabled.invalid", port: 1080)]] {
             configuration.enabled = true
             configuration.entries = entries.map { entry in var value = entry; value.enabled = false; return value }
-            do {
-                _ = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
-                                                        test: test, discard: { _, _ in XCTFail("Nothing to discard") })
-                XCTFail("An enabled empty pool must not allow direct connection")
-            } catch {
-                XCTAssertTrue(error is ProxyManager.SelectionError)
+            XCTAssertThrowsError(try ProxyManager.selectProxy(configuration: configuration, completedCount: 0)) {
+                XCTAssertTrue($0 is ProxyManager.SelectionError)
             }
         }
     }
 
     @MainActor
-    func testSameProxyIsRetestedBeforeEachUse() async throws {
-        var configuration = ProxyConfiguration()
-        configuration.enabled = true
-        configuration.switchEvery = 10
-        configuration.entries = [ProxyEntry(host: "reused.invalid", port: 1080)]
-        var tests = 0
-        for completedCount in 0..<2 {
-            let selection = try await ProxyManager.selectProxy(configuration: configuration, completedCount: completedCount, test: { _ in
-                tests += 1
-                return self.result(100)
-            }, discard: { _, _ in XCTFail("The proxy passed") })
-            XCTAssertEqual(selection?.entry.id, configuration.entries.first?.id)
-        }
-        XCTAssertEqual(tests, 2)
-    }
-
-    @MainActor
-    func testCancellationDuringPreflightDoesNotDiscardProxyOrTryAnother() async {
+    func testCancelledSelectionDoesNotChangePool() async {
         var configuration = ProxyConfiguration()
         configuration.enabled = true
         configuration.entries = (1...2).map { ProxyEntry(host: "cancel\($0).invalid", port: 1080) }
-        var tested: [UUID] = []
+        let expected = configuration.entries
         let task = Task {
-            try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0, test: { entry in
-                tested.append(entry.id)
-                withUnsafeCurrentTask { $0?.cancel() }
-                return self.result(10_000, verdict: .unreachable)
-            }, discard: { _, _ in XCTFail("Cancellation must not remove a proxy") })
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try ProxyManager.selectProxy(configuration: configuration, completedCount: 0)
         }
         do {
             _ = try await task.value
@@ -350,7 +238,7 @@ final class ProxyManagerTests: XCTestCase {
         } catch {
             XCTAssertTrue(error is CancellationError)
         }
-        XCTAssertEqual(tested, [configuration.entries[0].id])
+        XCTAssertEqual(configuration.entries, expected)
     }
 
     @MainActor

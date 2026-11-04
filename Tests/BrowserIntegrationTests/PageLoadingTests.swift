@@ -232,13 +232,11 @@ final class PageLoadingTests: XCTestCase {
         var nextProxy: UUID?
         var attempted: [UUID] = []
         try await RegistrationRetry.run(selectProxy: { previous, excluded in
-            let selection = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 1,
-                                                               startingAfter: previous, startingAt: nextProxy,
-                                                               excluding: excluded, test: { _ in
-                ProxyManager.TestResult(verdict: .usable, status: 200, milliseconds: 100, exit: nil, error: nil)
-            }, discard: { _, _ in XCTFail("Fixture proxies pass preflight") })
+            let selection = try ProxyManager.selectProxy(configuration: configuration, completedCount: 1,
+                                                         startingAfter: previous, startingAt: nextProxy,
+                                                         excluding: excluded)
             nextProxy = nil
-            return selection?.entry
+            return selection
         }, attempt: { proxy in
             let entry = try XCTUnwrap(proxy)
             attempted.append(entry.id)
@@ -249,7 +247,7 @@ final class PageLoadingTests: XCTestCase {
             }
         }, shouldRetry: { true }, onRetry: { entry, error in
             XCTAssertTrue(error is PageLoadTimeout)
-            nextProxy = ProxyManager.discardTimedOutProxy(entry, configuration: &configuration)
+            nextProxy = ProxyManager.discardFailedProxy(entry, configuration: &configuration)
         })
         XCTAssertEqual(attempted, [original[1].id, original[2].id])
         XCTAssertEqual(configuration.entries, [original[0], original[2], original[3]])

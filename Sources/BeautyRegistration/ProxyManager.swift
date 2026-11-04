@@ -58,51 +58,37 @@ enum ProxyManager {
         }
     }
 
-    enum TestPurpose {
-        case pool, beforeUse
-
-        func limitMilliseconds(in configuration: RegistrationCore.ProxyConfiguration) -> Int {
-            self == .pool ? configuration.poolTestLimitMilliseconds : configuration.preflightTestLimitMilliseconds
-        }
-
-        func timeout(in configuration: RegistrationCore.ProxyConfiguration) -> TimeInterval {
-            Double(limitMilliseconds(in: configuration)) / 1_000
-        }
-
-        func accepts(_ result: TestResult, configuration: RegistrationCore.ProxyConfiguration) -> Bool {
-            let limit = limitMilliseconds(in: configuration)
-            guard limit > 0, result.verdict == .usable else { return false }
-            return self == .pool ? result.milliseconds <= limit : result.milliseconds < limit
-        }
+    static func poolTestTimeout(in configuration: RegistrationCore.ProxyConfiguration) -> TimeInterval {
+        Double(configuration.poolTestLimitMilliseconds) / 1_000
     }
 
-    struct Selection {
-        let entry: ProxyEntry
-        let result: TestResult
+    static func acceptsPoolResult(_ result: TestResult, configuration: RegistrationCore.ProxyConfiguration) -> Bool {
+        let limit = configuration.poolTestLimitMilliseconds
+        return limit > 0 && result.verdict == .usable && result.milliseconds <= limit
     }
 
     enum SelectionError: LocalizedError {
-        case exhausted(limitMilliseconds: Int)
+        case exhausted
         case registrationFailed
         var errorDescription: String? {
             switch self {
-            case .exhausted(let limit): return "当前没有通过使用前复测的代理（需低于 \(limit) ms），补充代理后会自动继续。"
+            case .exhausted: return "当前没有可用代理，补充代理后会自动继续。"
             case .registrationFailed: return "当前账号已尝试本轮所有可用代理，稍后自动开始下一轮。"
             }
         }
     }
 
     @discardableResult
-    static func discardIfNeeded(_ entry: ProxyEntry, result: TestResult, purpose: TestPurpose,
+    static func discardIfNeeded(_ entry: ProxyEntry, result: TestResult,
                                 configuration: inout RegistrationCore.ProxyConfiguration) -> Bool {
-        guard !purpose.accepts(result, configuration: configuration) else { return false }
+        guard !acceptsPoolResult(result, configuration: configuration) else { return false }
         let count = configuration.entries.count
         configuration.entries.removeAll { $0.id == entry.id }
         return configuration.entries.count != count
     }
 
     /// Capture the successor before removal changes the rotation indices.
-    static func discardTimedOutProxy(_ entry: ProxyEntry, configuration: inout RegistrationCore.ProxyConfiguration) -> UUID? {
+    static func discardFailedProxy(_ entry: ProxyEntry, configuration: inout RegistrationCore.ProxyConfiguration) -> UUID? {
         let pool = configuration.activeEntries
         let next: UUID?
         if pool.count > 1, let index = pool.firstIndex(where: { $0.id == entry.id }) {
@@ -112,18 +98,15 @@ enum ProxyManager {
         return next
     }
 
-    /// Snapshot the order before removing failures so shrinking the pool cannot skip a successor.
+    /// Selection never makes a network request. The registration flow handles connection failures.
     @MainActor
     static func selectProxy(configuration: RegistrationCore.ProxyConfiguration, completedCount: Int,
                             startingAfter previous: UUID? = nil, startingAt preferredID: UUID? = nil,
-                            excluding excluded: Set<UUID> = [],
-                            test: (ProxyEntry) async throws -> TestResult,
-                            discard: (ProxyEntry, TestResult) throws -> Void) async throws -> Selection? {
+                            excluding excluded: Set<UUID> = []) throws -> ProxyEntry? {
         try Task.checkCancellation()
         guard configuration.enabled else { return nil }
-        try configuration.validateLatencyLimits()
         let pool = configuration.activeEntries
-        let exhausted = excluded.isEmpty ? SelectionError.exhausted(limitMilliseconds: configuration.preflightTestLimitMilliseconds) : .registrationFailed
+        let exhausted = excluded.isEmpty ? SelectionError.exhausted : .registrationFailed
         guard let preferred = configuration.proxy(forCompletedCount: completedCount),
               let preferredIndex = pool.firstIndex(where: { $0.id == preferred.id }) else {
             throw exhausted
@@ -135,10 +118,7 @@ enum ProxyManager {
             try Task.checkCancellation()
             let entry = pool[(start + offset) % pool.count]
             guard !excluded.contains(entry.id) else { continue }
-            let result = try await test(entry)
-            try Task.checkCancellation()
-            if TestPurpose.beforeUse.accepts(result, configuration: configuration) { return Selection(entry: entry, result: result) }
-            try discard(entry, result)
+            return entry
         }
         throw exhausted
     }
@@ -170,12 +150,13 @@ enum ProxyManager {
         }
     }
 
-    static func session(through entry: ProxyEntry?, timeout: TimeInterval = 5) -> URLSession? {
+    static func session(through entry: ProxyEntry?, timeout: TimeInterval = 5, background: Bool = false) -> URLSession? {
         let config = URLSessionConfiguration.ephemeral
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = timeout
         config.timeoutIntervalForResource = timeout
+        if background { config.networkServiceType = .background }
         if let entry {
             guard #available(macOS 14.0, *), let proxy = configuration(for: entry) else { return nil }
             config.proxyConfigurations = [proxy]
@@ -189,6 +170,7 @@ enum ProxyManager {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("no-cache, no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        request.networkServiceType = .background
         return request
     }
 
@@ -236,7 +218,7 @@ enum ProxyManager {
     /// Asks the registration site's own Cloudflare edge which IP it sees, through the
     /// same proxy the API will use. Falls back to ipify. Returns nil when unreachable.
     static func exitInfo(through entry: ProxyEntry?) async -> ExitInfo? {
-        guard let session = session(through: entry) else { return nil }
+        guard let session = session(through: entry, background: true) else { return nil }
         defer { session.invalidateAndCancel() }
         return await exitInfo(using: session)
     }
@@ -258,13 +240,13 @@ enum ProxyManager {
     }
 
     /// Time the uncached status API request. Exit-IP lookups are reserved for the selected proxy.
-    static func test(_ entry: ProxyEntry, purpose: TestPurpose = .pool,
+    static func test(_ entry: ProxyEntry,
                      configuration: RegistrationCore.ProxyConfiguration = .init()) async -> TestResult {
         do { try configuration.validateLatencyLimits() } catch {
             return TestResult(verdict: .unreachable, status: nil, milliseconds: 0, exit: nil, error: error.localizedDescription)
         }
-        let timeout = purpose.timeout(in: configuration)
-        guard let session = session(through: entry, timeout: timeout) else {
+        let timeout = poolTestTimeout(in: configuration)
+        guard let session = session(through: entry, timeout: timeout, background: true) else {
             return TestResult(verdict: .unreachable, status: nil, milliseconds: 0, exit: nil,
                               error: isSupported ? "代理主机或端口无效" : "需要 macOS 14 或更高版本")
         }

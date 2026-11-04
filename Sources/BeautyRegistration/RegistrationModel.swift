@@ -6,6 +6,7 @@ import RegistrationCore
 final class RegistrationModel: ObservableObject {
     typealias TransportFactory = (ProxyEntry?, TimeInterval) throws -> NativeHTTPClient.Transport
     typealias ProxyTest = (ProxyEntry, ProxyConfiguration) async -> ProxyManager.TestResult
+    typealias ProxySourceFetch = (URL) async throws -> String
 
     @Published var configuration = TaskConfiguration()
     @Published var proxyConfiguration = ProxyConfiguration()
@@ -16,6 +17,15 @@ final class RegistrationModel: ObservableObject {
     @Published private(set) var proxyTestsCompleted = 0
     @Published private(set) var proxyTestsTotal = 0
     @Published private(set) var proxyTestsDiscarded = 0
+    @Published private(set) var isRefreshingProxySources = false
+    @Published private(set) var proxySourceStatus = "尚未更新代理来源"
+    @Published private(set) var proxySourceCandidates = 0
+    @Published private(set) var proxySourceTested = 0
+    @Published private(set) var proxySourceAdded = 0
+    @Published private(set) var proxySourceRejected = 0
+    @Published private(set) var proxySourceErrors: [String] = []
+    @Published private(set) var lastProxySourceRefreshAt: Date?
+    @Published private(set) var nextProxySourceRefreshAt: Date?
     private let rememberedPassword: RememberedPassword
     private var passwordObserver: AnyCancellable?
     private var monitorObserver: AnyCancellable?
@@ -62,9 +72,16 @@ final class RegistrationModel: ObservableObject {
     let networkMonitor = RequestMonitor()
     let store: JournalStore
     private let transportFactory: TransportFactory?
-    private let proxyTest: ProxyTest
+    private let poolProxyTest: ProxyTest
+    private let proxySourceFetch: ProxySourceFetch
+    private let proxyNetworkScheduler = ProxyNetworkScheduler()
+    private var proxySourceTask: Task<Void, Never>?
+    private var proxySourceTimer: Task<Void, Never>?
+    private var rejectedDuringSourceRefresh: Set<ProxyIdentity> = []
     private let retryDelaySeconds: TimeInterval
-    private var nextProxyID: UUID?
+    private var proxyRotation = ProxyRotationQueue()
+    private var currentProxy: ProxyEntry?
+    private var accountsWithCurrentProxy = 0
     private var runRecordIDs: Set<UUID> = []
     private var task: Task<Void, Never>?
     private var connectionTask: Task<Void, Never>?
@@ -94,14 +111,15 @@ final class RegistrationModel: ObservableObject {
 
     init(store: JournalStore? = nil, passwordStore: PasswordStore = LocalPasswordStore(),
          transportFactory: TransportFactory? = nil,
-         proxyTest: @escaping ProxyTest = { entry, config in
-             await ProxyManager.test(entry, purpose: .beforeUse, configuration: config)
-         }, retryDelaySeconds: TimeInterval = 5) {
+         retryDelaySeconds: TimeInterval = 5,
+         proxySourceFetch: @escaping ProxySourceFetch = { try await ProxySourceClient.fetch(from: $0) },
+         poolProxyTest: @escaping ProxyTest = { entry, config in await ProxyManager.test(entry, configuration: config) }) {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         self.store = store ?? JournalStore(directory: base.appendingPathComponent("BeautyRegistration", isDirectory: true))
         self.rememberedPassword = RememberedPassword(store: passwordStore)
         self.transportFactory = transportFactory
-        self.proxyTest = proxyTest
+        self.poolProxyTest = poolProxyTest
+        self.proxySourceFetch = proxySourceFetch
         self.retryDelaySeconds = retryDelaySeconds.isFinite ? max(0.01, min(3_600, retryDelaySeconds)) : 5
         passwordObserver = rememberedPassword.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
         monitorObserver = networkMonitor.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
@@ -127,7 +145,6 @@ final class RegistrationModel: ObservableObject {
         try proxyConfiguration.validatePageLoadingTimeout()
         if proxyConfiguration.enabled {
             guard ProxyManager.isSupported else { throw ClientError.message("代理功能需要 macOS 14 或更高版本。") }
-            try proxyConfiguration.validateLatencyLimits()
         }
     }
 
@@ -150,7 +167,14 @@ final class RegistrationModel: ObservableObject {
         }
         if let headers { networkMonitor.configure(headers) }
         return try NativeHTTPClient(baseURL: URL(string: origin)!, timeoutSeconds: seconds, headers: fields,
-                                    transport: transport, onRecord: { [weak self] entry in
+                                    transport: { [weak self] request in
+            guard let self else { throw CancellationError() }
+            try await self.gate()
+            return try await self.proxyNetworkScheduler.foreground(whenReady: { !self.isPaused }) {
+                try await self.gate()
+                return try await transport(request)
+            }
+        }, onRecord: { [weak self] entry in
             guard let self, self.attemptID == token else { return }
             self.networkMonitor.record(entry)
             guard let recordID, self.activeID == recordID,
@@ -194,7 +218,7 @@ final class RegistrationModel: ObservableObject {
     }
 
     func testProxies(_ entries: [ProxyEntry]) {
-        guard storageAvailable, !isRunning, !isCheckingConnection, !isTestingProxies, !entries.isEmpty else { return }
+        guard storageAvailable, !isRunning, !isCheckingConnection, !isTestingProxies, !isRefreshingProxySources, !entries.isEmpty else { return }
         guard ProxyManager.isSupported else { alert = "代理功能需要 macOS 14 或更高版本。"; return }
         if let proxyLatencyError { alert = proxyLatencyError; return }
         let concurrency = min(ProxyManager.maximumBatchConcurrency, max(1, proxyTestConcurrency))
@@ -211,7 +235,7 @@ final class RegistrationModel: ObservableObject {
             // Batch UI updates and array removals; never rewrite a 10,000-entry journal per result.
             @MainActor func flush() {
                 guard !pending.isEmpty else { return }
-                let rejected = Set(pending.compactMap { ProxyManager.TestPurpose.pool.accepts($0.value, configuration: testConfiguration) ? nil : $0.key })
+                let rejected = Set(pending.compactMap { ProxyManager.acceptsPoolResult($0.value, configuration: testConfiguration) ? nil : $0.key })
                 if !rejected.isEmpty { proxyConfiguration.entries.removeAll { rejected.contains($0.id) } }
                 proxyTestResults.merge(pending.filter { !rejected.contains($0.key) }) { _, new in new }
                 proxyTestPending.subtract(pending.keys)
@@ -221,7 +245,7 @@ final class RegistrationModel: ObservableObject {
                 lastFlush = ProcessInfo.processInfo.systemUptime
             }
             await ProxyManager.testBatch(entries, concurrencyLimit: concurrency, test: { entry in
-                await ProxyManager.test(entry, configuration: testConfiguration)
+                await self.testPoolProxy(entry, configuration: testConfiguration)
             }, completed: { entry, result in
                 pending[entry.id] = result
                 if ProcessInfo.processInfo.systemUptime - lastFlush >= 0.2 { flush() }
@@ -240,14 +264,6 @@ final class RegistrationModel: ObservableObject {
     func saveProxyLatencyLimits() {
         guard storageAvailable, proxyLatencyError == nil else { return }
         _ = persist()
-    }
-
-    private func discardProxyBeforeUse(_ entry: ProxyEntry, result: ProxyManager.TestResult, recordID: UUID) {
-        guard ProxyManager.discardIfNeeded(entry, result: result, purpose: .beforeUse,
-                                          configuration: &proxyConfiguration) else { return }
-        let message = "已丢弃代理 \(entry.displayName)：\(result.summary)。自动尝试下一个代理。"
-        log(message)
-        appendLog(recordID, message, persistImmediately: false)
     }
 
     func start() {
@@ -351,10 +367,12 @@ final class RegistrationModel: ObservableObject {
     private func beginRun(manual: Bool, count: Int) {
         persistenceError = nil
         isRunning = true; isPaused = false; isManualFlow = manual
+        proxyNetworkScheduler.setRegistrationConcurrency(proxyConfiguration.sourceConfiguration.registrationConcurrency)
         completedInRun = 0; totalInRun = count
         waitingForCode = false; verificationSent = false; submitRequested = false
         manualCode = ""; alert = nil
-        nextProxyID = nil; runRecordIDs.removeAll()
+        proxyRotation = ProxyRotationQueue(); currentProxy = nil; accountsWithCurrentProxy = 0
+        runRecordIDs.removeAll()
     }
 
     private func prepareRecord(_ record: AccountRecord) {
@@ -365,7 +383,10 @@ final class RegistrationModel: ObservableObject {
 
     private func finishRun(stopped: Bool) {
         closeSessions(); activeID = nil
+        proxyRotation = ProxyRotationQueue()
+        currentProxy = nil; accountsWithCurrentProxy = 0
         isRunning = false; isPaused = false; waitingForCode = false; submitRequested = false
+        proxyNetworkScheduler.setRegistrationConcurrency(nil)
         phase = stopped ? "任务已停止" : "任务完成"
         let currentRecords = records.filter { runRecordIDs.contains($0.id) }
         let succeeded = currentRecords.filter { $0.status == .succeeded }.count
@@ -389,32 +410,23 @@ final class RegistrationModel: ObservableObject {
 
     private func runAccount(_ record: AccountRecord, password: String, invitation: String,
                             headers: RequestHeaderConfiguration) async throws {
-        var excluded: Set<UUID> = []
-        var previous: UUID?
         while true {
             try await gate()
             let proxy: ProxyEntry?
-            do {
-                defer { _ = persist() }
-                let selection = try await ProxyManager.selectProxy(configuration: proxyConfiguration,
-                    completedCount: completedInRun, startingAfter: previous, startingAt: nextProxyID,
-                    excluding: excluded, test: { entry in
-                        try await self.gate()
-                        self.phase = "使用前复测代理"
-                        self.detail = "正在复测 \(entry.displayName)，需低于 \(self.proxyConfiguration.preflightTestLimitMilliseconds) ms。"
-                        let result = await self.proxyTest(entry, self.proxyConfiguration)
-                        try await self.gate()
-                        return result
-                    }, discard: { entry, result in
-                        self.discardProxyBeforeUse(entry, result: result, recordID: record.id)
-                    })
-                proxy = selection?.entry
-                nextProxyID = nil
-            } catch {
-                if error is CancellationError || Task.isCancelled { throw CancellationError() }
-                excluded.removeAll()
-                try await waitToRetry(record.id, error: error)
-                continue
+            if let currentProxy, proxyConfiguration.enabled, proxyConfiguration.entries.contains(currentProxy) {
+                // Reuse the selected proxy for its whole account group until a request fails.
+                proxy = currentProxy
+            } else {
+                currentProxy = nil; accountsWithCurrentProxy = 0
+                do {
+                    let selectionConfiguration = proxyRotation.selectionConfiguration(from: proxyConfiguration)
+                    proxy = try ProxyManager.selectProxy(configuration: selectionConfiguration, completedCount: 0)
+                    currentProxy = proxy
+                } catch {
+                    if error is CancellationError || Task.isCancelled { throw CancellationError() }
+                    try await waitToRetry(record.id, error: error)
+                    continue
+                }
             }
             try await gate()
             submissionAttempted = false; manualCode = ""; submitRequested = false
@@ -424,20 +436,22 @@ final class RegistrationModel: ObservableObject {
             do {
                 try await register(record, password: password, invitation: invitation, headers: headers, proxy: proxy)
                 try await gate()
+                if let proxy {
+                    accountsWithCurrentProxy += 1
+                    if accountsWithCurrentProxy >= max(1, proxyConfiguration.switchEvery) {
+                        proxyRotation.didFinishProxy(id: proxy.id)
+                        currentProxy = nil; accountsWithCurrentProxy = 0
+                    }
+                }
                 return
             } catch {
                 if error is CancellationError || Task.isCancelled { throw CancellationError() }
                 if let proxy {
-                    let pool = proxyConfiguration.activeEntries
-                    if let index = pool.firstIndex(where: { $0.id == proxy.id }), pool.count > 1 {
-                        nextProxyID = pool[(index + 1) % pool.count].id
-                    }
-                    if (error as? NativeAPIError)?.isTimeout == true {
-                        nextProxyID = ProxyManager.discardTimedOutProxy(proxy, configuration: &proxyConfiguration)
-                        appendLog(record.id, "接口超时，已丢弃代理 \(proxy.displayName)。")
-                    }
-                    previous = proxy.id
-                    excluded.insert(proxy.id)
+                    _ = ProxyManager.discardFailedProxy(proxy, configuration: &proxyConfiguration)
+                    proxyRotation.didFinishProxy(id: proxy.id)
+                    if isRefreshingProxySources { rejectedDuringSourceRefresh.insert(ProxyIdentity(proxy)) }
+                    currentProxy = nil; accountsWithCurrentProxy = 0
+                    appendLog(record.id, "注册流程失败，已丢弃代理 \(proxy.displayName)。")
                 }
                 if records.first(where: { $0.id == record.id })?.status == .succeeded {
                     try await gate()
@@ -484,8 +498,9 @@ final class RegistrationModel: ObservableObject {
         try await gate()
         if let proxy, transportFactory == nil {
             exitLookup = Task { [weak self] in
-                let info = await ProxyManager.exitInfo(through: proxy)
-                guard !Task.isCancelled, let self, self.attemptID == token, self.activeID == record.id else { return }
+                guard let self else { return }
+                let info = try? await self.proxyNetworkScheduler.background { await ProxyManager.exitInfo(through: proxy) }
+                guard !Task.isCancelled, self.attemptID == token, self.activeID == record.id else { return }
                 if let info {
                     self.log("出口 IP：\(info.summary)")
                     self.appendLog(record.id, "出口 IP：\(info.summary)")
@@ -630,12 +645,12 @@ final class RegistrationModel: ObservableObject {
         if records[i].logs.count > 500 { records[i].logs.removeFirst(records[i].logs.count - 500) }
         if persistImmediately { _ = persist() }
     }
-    @discardableResult private func persist() -> Bool {
+    @discardableResult private func persist(reportError: Bool = true) -> Bool {
         guard storageAvailable else { return false }
         do { try store.save(journal); persistenceError = nil; return true }
         catch {
             persistenceError = "本地记录暂不可写，恢复后自动继续。"
-            if !isRunning { alert = persistenceError }
+            if reportError && !isRunning { alert = persistenceError }
             return false
         }
     }
@@ -656,4 +671,177 @@ final class RegistrationModel: ObservableObject {
         update(id, status: exists ? .succeeded : .failed,
                note: exists ? "用户已在官网核对：账号注册成功。" : "用户已在官网核对：账号未注册，允许重新创建任务。")
     }
+}
+
+extension RegistrationModel {
+    private func testPoolProxy(_ entry: ProxyEntry, configuration: ProxyConfiguration) async -> ProxyManager.TestResult {
+        do {
+            return try await proxyNetworkScheduler.background { await self.poolProxyTest(entry, configuration) }
+        } catch {
+            // The cancelled batch drops this result; foreground preemption is retried by the scheduler.
+            return .init(verdict: .unreachable, status: nil, milliseconds: 0, exit: nil, error: "测速已取消")
+        }
+    }
+
+    /// The window starts one app-lifetime timer; changing tabs or opening another window is harmless.
+    func startProxySourceUpdates() {
+        guard proxySourceTimer == nil, storageAvailable, ProxyManager.isSupported else { return }
+        if proxyConfiguration.sourceConfiguration.automatic { nextProxySourceRefreshAt = Date() }
+        proxySourceTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+                self?.refreshProxySourcesIfDue()
+                if self == nil { return }
+            }
+        }
+        refreshProxySourcesIfDue()
+    }
+
+    func stopProxySourceUpdates() {
+        proxySourceTimer?.cancel(); proxySourceTimer = nil
+        stopProxySourceRefresh()
+        nextProxySourceRefreshAt = nil
+    }
+
+    func refreshProxySourcesIfDue(at now: Date = Date()) {
+        let settings = proxyConfiguration.sourceConfiguration
+        guard storageAvailable, settings.automatic, !settings.urls.isEmpty else {
+            nextProxySourceRefreshAt = nil
+            return
+        }
+        guard let next = nextProxySourceRefreshAt, now >= next,
+              !isRefreshingProxySources, !isTestingProxies else { return }
+        refreshProxySources(now: now)
+    }
+
+    @discardableResult
+    func saveRegistrationProxyConcurrency(_ limit: Int) -> Bool {
+        var settings = proxyConfiguration.sourceConfiguration
+        settings.registrationConcurrency = limit
+        do { try settings.validate() } catch { proxySourceStatus = safeError(error); return false }
+        proxyConfiguration.sourceConfiguration = settings
+        if isRunning { proxyNetworkScheduler.setRegistrationConcurrency(limit) }
+        return persist(reportError: false)
+    }
+
+    @discardableResult
+    func saveProxySourceConfiguration(_ value: ProxySourceConfiguration) -> Bool {
+        guard storageAvailable else { return false }
+        do { try value.validate() } catch { proxySourceStatus = safeError(error); return false }
+        var normalized = value
+        var seen: Set<String> = []
+        normalized.urls = value.urls.compactMap { raw in
+            guard let url = try? ProxySources.url(from: raw), seen.insert(url.absoluteString).inserted else { return nil }
+            return url.absoluteString
+        }
+        proxyConfiguration.sourceConfiguration = normalized
+        if isRunning { proxyNetworkScheduler.setRegistrationConcurrency(normalized.registrationConcurrency) }
+        guard persist(reportError: false) else {
+            proxySourceStatus = "代理来源设置暂未保存，本地记录恢复后请再次保存。"
+            return false
+        }
+        scheduleNextProxySourceRefresh(from: Date())
+        proxySourceStatus = normalized.automatic ? "已保存，按设定间隔自动更新代理。" : "已关闭定时更新，仍可手动更新。"
+        return true
+    }
+
+    private func scheduleNextProxySourceRefresh(from now: Date) {
+        let settings = proxyConfiguration.sourceConfiguration
+        nextProxySourceRefreshAt = settings.automatic && !settings.urls.isEmpty
+            ? now.addingTimeInterval(Double(settings.intervalMinutes) * 60) : nil
+    }
+
+    func refreshProxySources(now: Date = Date()) {
+        guard storageAvailable, !isRefreshingProxySources else { return }
+        guard !isTestingProxies else {
+            proxySourceStatus = "等待当前手动批量测试结束后再更新来源。"
+            return
+        }
+        guard ProxyManager.isSupported else { proxySourceStatus = "代理功能需要 macOS 14 或更高版本。"; return }
+        scheduleNextProxySourceRefresh(from: now)
+        let settings = proxyConfiguration.sourceConfiguration
+        do { try settings.validate(); try proxyConfiguration.validateLatencyLimits() }
+        catch { proxySourceStatus = safeError(error); return }
+        guard !settings.urls.isEmpty else { proxySourceStatus = "请先添加代理来源。"; return }
+        var seenURLs: Set<String> = []
+        let urls = settings.urls.compactMap { raw -> URL? in
+            guard let url = try? ProxySources.url(from: raw), seenURLs.insert(url.absoluteString).inserted else { return nil }
+            return url
+        }
+        let testConfiguration = proxyConfiguration
+        let concurrency = min(ProxyManager.maximumBatchConcurrency, max(1, proxyTestConcurrency))
+        isRefreshingProxySources = true
+        proxySourceCandidates = 0; proxySourceTested = 0; proxySourceAdded = 0; proxySourceRejected = 0
+        proxySourceErrors.removeAll(); rejectedDuringSourceRefresh.removeAll()
+        proxySourceStatus = "正在下载代理来源。"
+        proxySourceTask = Task {
+            defer {
+                lastProxySourceRefreshAt = Date()
+                isRefreshingProxySources = false; proxySourceTask = nil
+                rejectedDuringSourceRefresh.removeAll()
+            }
+            do {
+                var lists: [String] = []
+                for (index, url) in urls.enumerated() {
+                    try Task.checkCancellation()
+                    proxySourceStatus = "正在下载来源 \(index + 1)/\(urls.count)：\(url.host ?? "")"
+                    do {
+                        let text = try await proxyNetworkScheduler.background { try await self.proxySourceFetch(url) }
+                        try Task.checkCancellation()
+                        lists.append(text)
+                    } catch {
+                        if error is CancellationError || Task.isCancelled { throw CancellationError() }
+                        let reason = (error as? ClientError)?.localizedDescription ?? "下载失败，下次更新时重试。"
+                        proxySourceErrors.append("来源 \(index + 1)（\(url.host ?? "")）：\(reason)")
+                    }
+                }
+                let existing = proxyConfiguration.entries
+                let candidates = await Task.detached(priority: .utility) { [lists, existing] in
+                    ProxySources.candidates(in: lists, excluding: existing)
+                }.value
+                try Task.checkCancellation()
+                proxySourceCandidates = candidates.count
+                proxySourceStatus = "正在测速新代理，仅把通过测试的代理加入池中。"
+                var pending: [(ProxyEntry, ProxyManager.TestResult)] = []
+                var lastFlush = ProcessInfo.processInfo.systemUptime - 1
+                @MainActor func flush() {
+                    guard !pending.isEmpty else { return }
+                    var known = Set(proxyConfiguration.entries.map(ProxyIdentity.init))
+                    var additions: [ProxyEntry] = []
+                    var results: [UUID: ProxyManager.TestResult] = [:]
+                    for (entry, result) in pending {
+                        let identity = ProxyIdentity(entry)
+                        if ProxyManager.acceptsPoolResult(result, configuration: testConfiguration),
+                           !rejectedDuringSourceRefresh.contains(identity) {
+                            if known.insert(identity).inserted { additions.append(entry); results[entry.id] = result }
+                        } else { proxySourceRejected += 1 }
+                    }
+                    proxySourceTested += pending.count
+                    proxySourceAdded += additions.count
+                    if !additions.isEmpty {
+                        proxyConfiguration.entries.append(contentsOf: additions)
+                        proxyTestResults.merge(results) { _, new in new }
+                        _ = persist(reportError: false)
+                    }
+                    pending.removeAll(keepingCapacity: true)
+                    lastFlush = ProcessInfo.processInfo.systemUptime
+                }
+                await ProxyManager.testBatch(candidates, concurrencyLimit: concurrency, test: { entry in
+                    await self.testPoolProxy(entry, configuration: testConfiguration)
+                }, completed: { entry, result in
+                    pending.append((entry, result))
+                    if ProcessInfo.processInfo.systemUptime - lastFlush >= 0.2 || !self.proxyConfiguration.entries.contains(where: \.enabled) { flush() }
+                })
+                flush()
+                try Task.checkCancellation()
+                proxySourceStatus = "更新完成：测速 \(proxySourceTested) 个，新增 \(proxySourceAdded) 个，丢弃 \(proxySourceRejected) 个。"
+                if !proxySourceErrors.isEmpty { proxySourceStatus += "\(proxySourceErrors.count) 个来源下载失败，其他来源已处理。" }
+                log("后台代理\(proxySourceStatus)")
+            } catch {
+                proxySourceStatus = Task.isCancelled || error is CancellationError ? "本次更新已停止，已通过测速的代理保留。" : "本次代理更新未完成，下次自动重试。"
+            }
+        }
+    }
+
+    func stopProxySourceRefresh() { proxySourceTask?.cancel() }
 }

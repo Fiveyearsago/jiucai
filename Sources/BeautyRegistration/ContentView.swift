@@ -34,6 +34,8 @@ struct ContentView: View {
         .onChange(of: model.configuration.prefix) { _ in refreshFormIfIdle() }
         .onChange(of: model.configuration.startIndex) { _ in refreshFormIfIdle() }
         .onChange(of: model.configuration.digits) { _ in refreshFormIfIdle() }
+        .onAppear { model.startProxySourceUpdates() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in model.stopProxySourceUpdates() }
     }
 
     private var sidebar: some View {
@@ -670,6 +672,34 @@ private struct ProxyConfigurationView: View {
     @State private var pasteText = ""
     @State private var parseError = ""
     @State private var selectedProxies: Set<UUID> = []
+    @State private var sourceIntervalDraft = ""
+    @State private var sourceURLDraft = ""
+
+    private var proxyControlsLocked: Bool {
+        model.isRunning || model.isTestingProxies || model.isRefreshingProxySources
+    }
+
+    private var sourceControlsLocked: Bool {
+        model.isRefreshingProxySources || !model.storageAvailable
+    }
+
+    private var automaticSourceUpdates: Binding<Bool> {
+        Binding(
+            get: { model.proxyConfiguration.sourceConfiguration.automatic },
+            set: { automatic in
+                var configuration = model.proxyConfiguration.sourceConfiguration
+                configuration.automatic = automatic
+                _ = model.saveProxySourceConfiguration(configuration)
+            }
+        )
+    }
+
+    private var registrationProbeConcurrency: Binding<Int> {
+        Binding(
+            get: { model.proxyConfiguration.sourceConfiguration.registrationConcurrency },
+            set: { _ = model.saveRegistrationProxyConcurrency($0) }
+        )
+    }
 
     private func resultColor(_ verdict: ProxyManager.TestResult.Verdict) -> Color {
         switch verdict { case .usable: return accent; case .blocked: return .orange; case .unreachable: return .red }
@@ -689,13 +719,15 @@ private struct ProxyConfigurationView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("代理池").font(.system(size: 25, weight: .semibold))
-                        Text("每个账号使用前复测代理；接口无法连接或注册出错时，自动换下一个代理重试当前账号。")
+                        Text("选中代理后直接开始注册；接口无法连接或注册出错时，丢弃当前代理并自动使用下一个。")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Toggle("启用代理", isOn: $model.proxyConfiguration.enabled)
-                        .toggleStyle(.switch).disabled(model.isRunning || model.isTestingProxies)
+                        .toggleStyle(.switch).disabled(proxyControlsLocked)
                 }
+
+                proxySourceCard
 
                 // Paste import
                 VStack(alignment: .leading, spacing: 10) {
@@ -724,7 +756,7 @@ private struct ProxyConfigurationView: View {
                         }.disabled(pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.storageAvailable || model.isTestingProxies)
                         Button("清空列表") {
                             model.proxyConfiguration.entries.removeAll()
-                        }.foregroundStyle(.red.opacity(0.8)).disabled(model.proxyConfiguration.entries.isEmpty || model.isRunning || model.isTestingProxies)
+                        }.foregroundStyle(.red.opacity(0.8)).disabled(model.proxyConfiguration.entries.isEmpty || proxyControlsLocked)
                     }
                 }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 13))
 
@@ -737,37 +769,29 @@ private struct ProxyConfigurationView: View {
                             let f = NumberFormatter(); f.numberStyle = .none; f.allowsFloats = false; return f
                         }()).frame(width: 60).textFieldStyle(.roundedBorder)
                         Text("个账号切换一次代理").font(.system(size: 13))
-                    }.disabled(model.isRunning || model.isTestingProxies)
-                    Text("代理按列表顺序循环使用，完成 switchEvery 个账号后切换到下一个。")
+                    }.disabled(proxyControlsLocked)
+                    Text("旧代理优先，新添加的代理排在下一轮末尾；使用前不再测速，注册失败立即丢弃并换下一个。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 13))
 
                 VStack(alignment: .leading, spacing: 10) {
                     Text("测速门槛与请求超时").font(.system(size: 14, weight: .semibold))
-                    HStack(spacing: 28) {
-                        HStack(spacing: 8) {
-                            Text("批量测试")
-                            TextField("3000", value: $model.proxyConfiguration.poolTestLimitMilliseconds, formatter: millisecondsFormatter)
-                                .frame(width: 90).textFieldStyle(.roundedBorder)
-                            Text("ms")
-                        }
-                        HStack(spacing: 8) {
-                            Text("使用前测速")
-                            TextField("5000", value: $model.proxyConfiguration.preflightTestLimitMilliseconds, formatter: millisecondsFormatter)
-                                .frame(width: 90).textFieldStyle(.roundedBorder)
-                            Text("ms")
-                        }
-                    }.font(.system(size: 13)).disabled(model.isRunning || model.isTestingProxies)
+                    HStack(spacing: 8) {
+                        Text("批量测试")
+                        TextField("3000", value: $model.proxyConfiguration.poolTestLimitMilliseconds, formatter: millisecondsFormatter)
+                            .frame(width: 90).textFieldStyle(.roundedBorder)
+                        Text("ms")
+                    }.font(.system(size: 13)).disabled(proxyControlsLocked)
                     Text("任务运行期间可以补充代理。代理全部不可用时，任务保持运行，添加代理后自动继续。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
-                    Text("批量测试超过门槛自动删除；使用前测速须低于门槛，否则删除并尝试下一个。请输入大于 0 的整数，设置自动保存。")
+                    Text("批量测试超过门槛自动删除。请输入大于 0 的整数，设置自动保存。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                     HStack(spacing: 8) {
                         Text("接口请求超时")
                         TextField("10", value: $model.proxyConfiguration.pageLoadingTimeoutSeconds, formatter: millisecondsFormatter)
                             .frame(width: 90).textFieldStyle(.roundedBorder)
                         Text("秒")
-                    }.font(.system(size: 13)).disabled(model.isRunning || model.isTestingProxies)
+                    }.font(.system(size: 13)).disabled(proxyControlsLocked)
                     Text("接口请求超过 \(model.proxyConfiguration.pageLoadingTimeoutSeconds) 秒未完成，自动删除当前代理并尝试下一个。等待邮件验证码不计入此时间。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                     if let error = model.proxyLatencyError {
@@ -785,21 +809,21 @@ private struct ProxyConfigurationView: View {
                             Button("删除选中 (\(selectedProxies.count))") {
                                 model.proxyConfiguration.entries.removeAll { selectedProxies.contains($0.id) }
                                 selectedProxies.removeAll()
-                            }.foregroundStyle(.red.opacity(0.8)).disabled(model.isRunning || model.isTestingProxies)
+                            }.foregroundStyle(.red.opacity(0.8)).disabled(proxyControlsLocked)
                         }
                         Picker("测试并发", selection: $model.proxyTestConcurrency) {
                             ForEach(1...ProxyManager.maximumBatchConcurrency, id: \.self) { Text("\($0) 个").tag($0) }
-                        }.frame(width: 140).disabled(model.isRunning || model.isTestingProxies)
+                        }.frame(width: 140).disabled(proxyControlsLocked)
                         if model.isTestingProxies {
                             Button("停止测试") { model.stopProxyTests() }
                         } else {
                             Button("全部测试") { model.testProxies(model.proxyConfiguration.entries) }
-                                .disabled(model.proxyConfiguration.entries.isEmpty || model.isRunning || model.proxyLatencyError != nil)
+                                .disabled(model.proxyConfiguration.entries.isEmpty || proxyControlsLocked || model.proxyLatencyError != nil)
                         }
                     }
                     Text("默认同时测试 \(ProxyManager.defaultBatchConcurrency) 个，最多 \(ProxyManager.maximumBatchConcurrency) 个；其余排队，排队时间不计入延时，网络较慢时可调为 1 个。测试超过 \(model.proxyConfiguration.poolTestLimitMilliseconds) ms 或不可用的代理会自动删除。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
-                    Text("测速只检查接口连接；每次使用前再单独复测，低于 \(model.proxyConfiguration.preflightTestLimitMilliseconds) ms 才使用，否则删除并继续尝试下一个。复测通过后读取出口 IP。开始注册会先停止批量测试。")
+                    Text("批量测速检查接口连接；使用代理时直接开始注册，请求失败自动丢弃并切换下一个。开始注册会先停止手动批量测试，后台自动补充代理继续运行。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                     if model.proxyTestsTotal > 0 {
                         HStack(spacing: 12) {
@@ -823,7 +847,7 @@ private struct ProxyConfigurationView: View {
                                     Image(systemName: selectedProxies.contains(entry.id) ? "checkmark.square.fill" : "square")
                                         .foregroundStyle(selectedProxies.contains(entry.id) ? accent : Color.secondary.opacity(0.5))
                                 }.buttonStyle(.plain)
-                                Toggle("", isOn: $entry.enabled).labelsHidden().disabled(model.isRunning || model.isTestingProxies)
+                                Toggle("", isOn: $entry.enabled).labelsHidden().disabled(proxyControlsLocked)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(verbatim: "\(entry.host):\(entry.port)").font(.system(size: 12, design: .monospaced))
                                     if !entry.user.isEmpty {
@@ -838,12 +862,12 @@ private struct ProxyConfigurationView: View {
                                     }
                                 }
                                 Spacer()
-                                Button("测试") { model.testProxies([entry]) }.disabled(model.isRunning || model.isTestingProxies || model.proxyLatencyError != nil)
+                                Button("测试") { model.testProxies([entry]) }.disabled(proxyControlsLocked || model.proxyLatencyError != nil)
                                 Button {
                                     model.proxyConfiguration.entries.removeAll { $0.id == entry.id }
                                 } label: {
                                     Image(systemName: "minus.circle.fill").foregroundStyle(.red.opacity(0.6))
-                                }.buttonStyle(.plain).disabled(model.isRunning || model.isTestingProxies)
+                                }.buttonStyle(.plain).disabled(proxyControlsLocked)
                             }.padding(.vertical, 4)
                             Divider()
                         }
@@ -855,12 +879,120 @@ private struct ProxyConfigurationView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }.padding(28)
         }
+        .onAppear {
+            sourceIntervalDraft = String(model.proxyConfiguration.sourceConfiguration.intervalMinutes)
+        }
+        .onChange(of: model.proxyConfiguration.sourceConfiguration.intervalMinutes) { interval in
+            sourceIntervalDraft = String(interval)
+        }
         .onChange(of: model.proxyConfiguration.entries.count) { _ in
             selectedProxies.formIntersection(model.proxyConfiguration.entries.map(\.id))
         }
         .onChange(of: model.proxyConfiguration.poolTestLimitMilliseconds) { _ in model.saveProxyLatencyLimits() }
-        .onChange(of: model.proxyConfiguration.preflightTestLimitMilliseconds) { _ in model.saveProxyLatencyLimits() }
         .onChange(of: model.proxyConfiguration.pageLoadingTimeoutSeconds) { _ in model.saveProxyLatencyLimits() }
+    }
+
+    private var proxySourceCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("自动补充代理").font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Toggle("定时更新", isOn: automaticSourceUpdates)
+                    .toggleStyle(.switch).disabled(!model.storageAvailable)
+            }
+            Text("从来源下载代理列表，自动测速后将可用代理加入代理池。注册运行期间也会持续补充。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            Text("注册请求优先，后台使用较低优先级；减少并发可降低网络占用，被打断的探测稍后重试，不计为不通。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+
+            Picker("注册时后台并发", selection: registrationProbeConcurrency) {
+                Text("0 个（注册请求时让路）").tag(0)
+                ForEach(1...3, id: \.self) { count in Text("\(count) 个").tag(count) }
+            }.frame(maxWidth: 350, alignment: .leading).disabled(!model.storageAvailable)
+            Text("默认 1 个，可在运行中调整。1–3 个与注册同时探测；0 个仅在注册请求间隙探测。任务结束后恢复普通测试并发。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Text("更新间隔")
+                TextField("60", text: $sourceIntervalDraft)
+                    .frame(width: 70).textFieldStyle(.roundedBorder)
+                    .onSubmit(saveSourceInterval)
+                Text("分钟")
+                Button("保存间隔", action: saveSourceInterval)
+            }.font(.system(size: 13)).disabled(sourceControlsLocked)
+
+            VStack(alignment: .leading, spacing: 9) {
+                Text("代理来源").font(.system(size: 12, weight: .medium))
+                ForEach(Array(model.proxyConfiguration.sourceConfiguration.urls.enumerated()), id: \.offset) { index, url in
+                    HStack(alignment: .top, spacing: 12) {
+                        Text(verbatim: url).font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button("移除") { removeSourceURL(at: index) }
+                            .disabled(sourceControlsLocked)
+                    }
+                }
+                HStack(spacing: 8) {
+                    TextField("https://example.com/proxies.txt", text: $sourceURLDraft)
+                        .textFieldStyle(.roundedBorder).onSubmit(addSourceURL)
+                    Button("添加来源", action: addSourceURL)
+                        .disabled(sourceURLDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }.disabled(sourceControlsLocked)
+            }
+
+            Divider()
+            HStack(spacing: 10) {
+                Button("立即更新并测速") { model.refreshProxySources() }
+                    .disabled(model.isRefreshingProxySources || model.isTestingProxies || !model.storageAvailable || model.proxyConfiguration.sourceConfiguration.urls.isEmpty || model.proxyLatencyError != nil)
+                if model.isRefreshingProxySources {
+                    ProgressView().controlSize(.small)
+                    Button("停止更新") { model.stopProxySourceRefresh() }
+                }
+                Spacer()
+            }
+            if !model.proxySourceStatus.isEmpty {
+                Text(model.proxySourceStatus).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text("候选 \(model.proxySourceCandidates) · 已测 \(model.proxySourceTested) · 新增 \(model.proxySourceAdded) · 淘汰 \(model.proxySourceRejected)")
+                .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("上次更新：\(sourceRefreshDate(model.lastProxySourceRefreshAt, fallback: "尚未更新"))")
+                Text("下次更新：\(sourceRefreshDate(model.nextProxySourceRefreshAt, fallback: "未安排"))")
+            }.font(.system(size: 11)).foregroundStyle(.secondary)
+            ForEach(Array(model.proxySourceErrors.enumerated()), id: \.offset) { _, error in
+                Text(verbatim: error).font(.system(size: 11)).foregroundStyle(.red)
+                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            }
+        }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 13))
+    }
+
+    private func saveSourceInterval() {
+        guard !sourceControlsLocked else { return }
+        var configuration = model.proxyConfiguration.sourceConfiguration
+        configuration.intervalMinutes = Int(sourceIntervalDraft.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        if model.saveProxySourceConfiguration(configuration) {
+            sourceIntervalDraft = String(model.proxyConfiguration.sourceConfiguration.intervalMinutes)
+        }
+    }
+
+    private func addSourceURL() {
+        guard !sourceControlsLocked else { return }
+        var configuration = model.proxyConfiguration.sourceConfiguration
+        configuration.urls.append(sourceURLDraft.trimmingCharacters(in: .whitespacesAndNewlines))
+        if model.saveProxySourceConfiguration(configuration) { sourceURLDraft = "" }
+    }
+
+    private func removeSourceURL(at index: Int) {
+        guard !sourceControlsLocked else { return }
+        var configuration = model.proxyConfiguration.sourceConfiguration
+        guard configuration.urls.indices.contains(index) else { return }
+        configuration.urls.remove(at: index)
+        _ = model.saveProxySourceConfiguration(configuration)
+    }
+
+    private func sourceRefreshDate(_ date: Date?, fallback: String) -> String {
+        date?.formatted(date: .abbreviated, time: .standard) ?? fallback
     }
 }
 

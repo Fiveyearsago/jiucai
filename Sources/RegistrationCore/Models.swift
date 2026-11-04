@@ -107,12 +107,20 @@ public struct ProxyEntry: Codable, Equatable, Identifiable {
 
     /// Parse a single `host:port[:user[:password]]` line. Returns nil for blank/malformed lines.
     public static func parse(_ line: String) -> ProxyEntry? {
-        let parts = line.trimmingCharacters(in: .whitespaces).components(separatedBy: ":")
+        let line = line.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{FEFF}")))
+        if line.lowercased().hasPrefix("socks5://") {
+            guard let components = URLComponents(string: line), let host = components.host, !host.isEmpty,
+                  !host.contains(where: \.isWhitespace), let port = components.port, (1...65_535).contains(port),
+                  components.path.isEmpty || components.path == "/", components.query == nil, components.fragment == nil else { return nil }
+            return ProxyEntry(host: host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")), port: port,
+                              user: components.user ?? "", password: components.password ?? "")
+        }
+        let parts = line.components(separatedBy: ":")
         guard parts.count >= 2,
               let port = Int(parts[1].trimmingCharacters(in: .whitespaces)),
               (1...65535).contains(port) else { return nil }
         let host = parts[0].trimmingCharacters(in: .whitespaces)
-        guard !host.isEmpty else { return nil }
+        guard host.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil else { return nil }
         let user = parts.count >= 3 ? parts[2].trimmingCharacters(in: .whitespaces) : ""
         let password = parts.count >= 4 ? parts[3...].joined(separator: ":").trimmingCharacters(in: .whitespaces) : ""
         return ProxyEntry(host: host, port: port, user: user, password: password)
@@ -124,19 +132,20 @@ public struct ProxyEntry: Codable, Equatable, Identifiable {
 /// Proxy pool configuration stored alongside the journal.
 public struct ProxyConfiguration: Codable, Equatable {
     public var entries: [ProxyEntry] = []
-    /// Switch to the next proxy after this many processed accounts; failures advance immediately.
+    /// Switch after this many successful accounts on the selected proxy; failures discard it immediately.
     public var switchEvery: Int = 1
     public var enabled: Bool = false
     public var poolTestLimitMilliseconds: Int = 3_000
-    public var preflightTestLimitMilliseconds: Int = 5_000
+    public var sourceConfiguration = ProxySourceConfiguration()
     /// Native API request timeout. The legacy property and coding key are retained.
     public var pageLoadingTimeoutSeconds: Int = 10
 
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case entries, switchEvery, enabled, poolTestLimitMilliseconds, preflightTestLimitMilliseconds
+        case entries, switchEvery, enabled, poolTestLimitMilliseconds
         case pageLoadingTimeoutSeconds
+        case sourceConfiguration
     }
 
     public init(from decoder: Decoder) throws {
@@ -145,13 +154,12 @@ public struct ProxyConfiguration: Codable, Equatable {
         switchEvery = try values.decode(Int.self, forKey: .switchEvery)
         enabled = try values.decode(Bool.self, forKey: .enabled)
         poolTestLimitMilliseconds = try values.decodeIfPresent(Int.self, forKey: .poolTestLimitMilliseconds) ?? 3_000
-        preflightTestLimitMilliseconds = try values.decodeIfPresent(Int.self, forKey: .preflightTestLimitMilliseconds) ?? 5_000
         pageLoadingTimeoutSeconds = try values.decodeIfPresent(Int.self, forKey: .pageLoadingTimeoutSeconds) ?? 10
+        sourceConfiguration = try values.decodeIfPresent(ProxySourceConfiguration.self, forKey: .sourceConfiguration) ?? .init()
     }
 
     public func validateLatencyLimits() throws {
         guard poolTestLimitMilliseconds > 0 else { throw ClientError.message("批量测速门槛须为大于 0 的整数（ms）。") }
-        guard preflightTestLimitMilliseconds > 0 else { throw ClientError.message("使用前测速门槛须为大于 0 的整数（ms）。") }
         try validatePageLoadingTimeout()
     }
 

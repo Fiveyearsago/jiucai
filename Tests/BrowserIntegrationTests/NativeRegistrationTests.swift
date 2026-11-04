@@ -12,23 +12,174 @@ final class NativeRegistrationTests: XCTestCase {
     }
 
     private func model(factory: @escaping RegistrationModel.TransportFactory,
-                       proxyTest: @escaping RegistrationModel.ProxyTest = { _, _ in
+                       poolProxyTest: @escaping RegistrationModel.ProxyTest = { _, _ in
                            .init(verdict: .usable, status: 200, milliseconds: 20, exit: nil, error: nil)
                        }) throws -> RegistrationModel {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("native-workflow-\(UUID())")
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         let model = RegistrationModel(store: JournalStore(directory: directory.appendingPathComponent("journal")),
                                       passwordStore: LocalPasswordStore(directory: directory.appendingPathComponent("password")),
-                                      transportFactory: factory, proxyTest: proxyTest, retryDelaySeconds: 0.02)
+                                      transportFactory: factory, retryDelaySeconds: 0.02, poolProxyTest: poolProxyTest)
         model.password = "fixture-password"
         model.acknowledgedMailboxTerms = true
         model.autoReadMailbox = false
         return model
     }
 
-    private func until(_ condition: () -> Bool) async throws {
-        let ready = try await WorkflowWait.until(timeout: 3, pollEvery: 0.01) { condition() }
+    private func until(timeout: TimeInterval = 3, _ condition: () -> Bool) async throws {
+        let ready = try await WorkflowWait.until(timeout: timeout, pollEvery: 0.01) { condition() }
         XCTAssertTrue(ready, "Workflow did not reach expected state")
+    }
+
+    func testRegistrationStartsWithoutPreflightAndSwitchesOnConnectionFailure() async throws {
+        let first = ProxyEntry(host: "direct-first.invalid", port: 1080)
+        let second = ProxyEntry(host: "direct-second.invalid", port: 1080)
+        var batchTests = 0
+        var requests: [UUID?] = []
+        let model = try model(factory: { proxy, _ in
+            return { request in
+                requests.append(proxy?.id)
+                if proxy?.id == first.id { throw URLError(.timedOut) }
+                return self.response(request, request.url!.path == "/api/status" ? self.statusWithoutEmail : #"{"success":true}"#)
+            }
+        }, poolProxyTest: { _, _ in
+            batchTests += 1
+            return .init(verdict: .unreachable, status: nil, milliseconds: 0, exit: nil, error: "must not preflight")
+        })
+        defer { model.stop() }
+        model.proxyConfiguration.enabled = true; model.proxyConfiguration.entries = [first, second]
+        model.start()
+        try await until(timeout: 1) { !model.isRunning }
+        XCTAssertEqual(batchTests, 0)
+        XCTAssertEqual(requests, [first.id, second.id, second.id])
+        XCTAssertEqual(model.proxyConfiguration.entries, [second])
+        XCTAssertEqual(model.records.first?.status, .succeeded)
+        XCTAssertFalse(model.isPaused)
+    }
+
+    func testSixAccountGroupUsesSameProxyWithoutExtraStatusRequests() async throws {
+        let first = ProxyEntry(host: "six-first.invalid", port: 1080)
+        let second = ProxyEntry(host: "six-second.invalid", port: 1080)
+        var statusRequests: [UUID?] = []
+        var posts: [UUID?] = []
+        let model = try model(factory: { proxy, _ in
+            return { request in
+                if request.url!.path == "/api/status" {
+                    statusRequests.append(proxy?.id)
+                    return self.response(request, self.statusWithoutEmail)
+                }
+                posts.append(proxy?.id)
+                return self.response(request, #"{"success":true}"#)
+            }
+        })
+        defer { model.stop() }
+        model.configuration.count = 7; model.configuration.intervalSeconds = 3
+        model.proxyConfiguration.enabled = true; model.proxyConfiguration.entries = [first, second]
+        model.proxyConfiguration.switchEvery = 6
+        model.start()
+        try await until(timeout: 25) { !model.isRunning }
+        XCTAssertEqual(statusRequests, Array(repeating: first.id, count: 6) + [second.id])
+        XCTAssertEqual(posts, Array(repeating: first.id, count: 6) + [second.id])
+        XCTAssertEqual(model.completedInRun, 7)
+        XCTAssertTrue(model.records.allSatisfy { $0.status == .succeeded })
+    }
+
+    func testFailureWithinGroupDeletesProxyAndStartsFullGroupOnSuccessor() async throws {
+        let first = ProxyEntry(host: "group-first.invalid", port: 1080)
+        let second = ProxyEntry(host: "group-second.invalid", port: 1080)
+        let third = ProxyEntry(host: "group-third.invalid", port: 1080)
+        var attempts: [UUID?] = []
+        var posts: [UUID?] = []
+        let model = try model(factory: { proxy, _ in
+            attempts.append(proxy?.id)
+            let shouldFail = attempts.count == 2
+            return { request in
+                if shouldFail { throw URLError(.cannotConnectToHost) }
+                if request.url!.path == "/api/status" { return self.response(request, self.statusWithoutEmail) }
+                posts.append(proxy?.id)
+                return self.response(request, #"{"success":true}"#)
+            }
+        })
+        defer { model.stop() }
+        model.configuration.count = 4; model.configuration.intervalSeconds = 3
+        model.proxyConfiguration.enabled = true; model.proxyConfiguration.entries = [first, second, third]
+        model.proxyConfiguration.switchEvery = 2
+        model.start()
+        try await until(timeout: 15) { !model.isRunning }
+        XCTAssertEqual(attempts, [first.id, first.id, second.id, second.id, third.id])
+        XCTAssertEqual(posts, [first.id, second.id, second.id, third.id])
+        XCTAssertEqual(model.proxyConfiguration.entries, [second, third])
+        XCTAssertEqual(model.completedInRun, 4)
+    }
+
+    func testReturningToProxyAfterRotationUsesOnlyRegistrationRequests() async throws {
+        let first = ProxyEntry(host: "cycle-first.invalid", port: 1080)
+        let second = ProxyEntry(host: "cycle-second.invalid", port: 1080)
+        var statusRequests: [UUID?] = []
+        var posts: [UUID?] = []
+        let model = try model(factory: { proxy, _ in
+            return { request in
+                if request.url!.path == "/api/status" {
+                    statusRequests.append(proxy?.id)
+                    return self.response(request, self.statusWithoutEmail)
+                }
+                posts.append(proxy?.id)
+                return self.response(request, #"{"success":true}"#)
+            }
+        })
+        defer { model.stop() }
+        model.configuration.count = 3; model.configuration.intervalSeconds = 3
+        model.proxyConfiguration.enabled = true; model.proxyConfiguration.entries = [first, second]
+        model.start()
+        try await until(timeout: 10) { !model.isRunning }
+        XCTAssertEqual(statusRequests, [first.id, second.id, first.id])
+        XCTAssertEqual(posts, [first.id, second.id, first.id])
+    }
+
+    func testNewProxyAddedAtOldTailWaitsBehindOlderProxiesInNextRound() async throws {
+        let first = ProxyEntry(host: "old-first.invalid", port: 1080)
+        let second = ProxyEntry(host: "old-tail.invalid", port: 1080)
+        let added = ProxyEntry(host: "new-last.invalid", port: 1080)
+        var posts: [UUID?] = []
+        var activeModel: RegistrationModel?
+        let model = try model { proxy, _ in
+            return { request in
+                if request.url!.path == "/api/status" { return self.response(request, self.statusWithoutEmail) }
+                posts.append(proxy?.id)
+                if posts.count == 2 { activeModel?.proxyConfiguration.entries.append(added) }
+                return self.response(request, #"{"success":true}"#)
+            }
+        }
+        activeModel = model
+        defer { activeModel = nil; model.stop() }
+        model.configuration.count = 3; model.configuration.intervalSeconds = 3
+        model.proxyConfiguration.enabled = true; model.proxyConfiguration.entries = [first, second]
+        model.start()
+        try await until(timeout: 10) { !model.isRunning }
+        XCTAssertEqual(posts, [first.id, second.id, first.id])
+        XCTAssertEqual(model.proxyConfiguration.entries, [first, second, added])
+        XCTAssertTrue(model.records.allSatisfy { $0.status == .succeeded })
+    }
+
+    func testStartingAnotherRunUsesOnlyRegistrationRequests() async throws {
+        let proxy = ProxyEntry(host: "new-run.invalid", port: 1080)
+        var statusRequests: [UUID?] = []
+        let model = try model(factory: { selected, _ in
+            return { request in
+                if request.url!.path == "/api/status" { statusRequests.append(selected?.id) }
+                return self.response(request, request.url!.path == "/api/status" ? self.statusWithoutEmail : #"{"success":true}"#)
+            }
+        })
+        defer { model.stop() }
+        model.proxyConfiguration.enabled = true; model.proxyConfiguration.entries = [proxy]
+        model.proxyConfiguration.switchEvery = 6
+        for _ in 0..<2 {
+            model.start()
+            try await until { !model.isRunning }
+        }
+        XCTAssertEqual(statusRequests, [proxy.id, proxy.id])
+        XCTAssertEqual(model.records.count, 2)
+        XCTAssertTrue(model.records.allSatisfy { $0.status == .succeeded })
     }
 
     func testManualFormSendsMailThenWaitsForExplicitSubmitUsingSameConnection() async throws {
@@ -156,6 +307,7 @@ final class NativeRegistrationTests: XCTestCase {
         try await until { !model.isRunning }
         XCTAssertEqual(posts, [first.id, second.id])
         XCTAssertEqual(model.records.first?.status, .succeeded)
+        XCTAssertEqual(model.proxyConfiguration.entries, [second])
     }
 
     func testMailboxChallengeSwitchesProxyAndAutomaticallyRecovers() async throws {
@@ -271,7 +423,7 @@ final class NativeRegistrationTests: XCTestCase {
         XCTAssertEqual(connections, 2)
         XCTAssertEqual(paths, ["/api/status", "/api/status", "/api/user/register"])
         XCTAssertEqual(model.records.first?.status, .succeeded)
-        XCTAssertEqual(model.proxyConfiguration.entries.count, 3)
+        XCTAssertEqual(model.proxyConfiguration.entries.count, 2)
         XCTAssertFalse(model.isPaused)
         XCTAssertNil(model.alert)
     }
@@ -416,9 +568,10 @@ final class NativeRegistrationTests: XCTestCase {
         activeModel = nil
     }
 
-    func testAllProxiesFailOneRoundThenAutomaticallyRetryUntilSuccess() async throws {
+    func testAllFailedProxiesAreDeletedAndNewProxyResumesCurrentAccount() async throws {
         let first = ProxyEntry(host: "round-first.invalid", port: 1080)
         let second = ProxyEntry(host: "round-second.invalid", port: 1080)
+        let added = ProxyEntry(host: "round-new.invalid", port: 1080)
         var attempts: [UUID?] = []
         let model = try model { proxy, _ in
             attempts.append(proxy?.id)
@@ -431,8 +584,14 @@ final class NativeRegistrationTests: XCTestCase {
         defer { model.stop() }
         model.proxyConfiguration.enabled = true; model.proxyConfiguration.entries = [first, second]
         model.start()
+        try await until { model.phase == "等待可用代理" }
+        XCTAssertTrue(model.proxyConfiguration.entries.isEmpty)
+        XCTAssertTrue(model.isRunning)
+        XCTAssertFalse(model.isPaused)
+        XCTAssertEqual(attempts, [first.id, second.id])
+        model.proxyConfiguration.entries.append(added)
         try await until { !model.isRunning }
-        XCTAssertEqual(attempts, [first.id, second.id, first.id])
+        XCTAssertEqual(attempts, [first.id, second.id, added.id])
         XCTAssertEqual(model.records.first?.status, .succeeded)
         XCTAssertEqual(model.records.count, 1)
         XCTAssertNil(model.alert)
@@ -484,6 +643,7 @@ final class NativeRegistrationTests: XCTestCase {
         XCTAssertEqual(posts.map(\.0), [model.configuration.username(176), model.configuration.username(177)])
         XCTAssertEqual(posts.map(\.1), [first.id, second.id])
         XCTAssertEqual(model.records.map(\.status), [.uncertain, .succeeded])
+        XCTAssertEqual(model.proxyConfiguration.entries, [second])
         XCTAssertEqual(model.completedInRun, 2)
         XCTAssertFalse(model.isPaused)
         XCTAssertNil(model.alert)
@@ -525,6 +685,7 @@ final class NativeRegistrationTests: XCTestCase {
         try await until { !model.isRunning }
         XCTAssertEqual(mailboxProxies, [first.id, second.id])
         XCTAssertEqual(posts, [second.id])
+        XCTAssertEqual(model.proxyConfiguration.entries, [second])
         XCTAssertEqual(model.records.first?.status, .succeeded)
         XCTAssertFalse(model.isPaused)
         XCTAssertNil(model.alert)
@@ -559,7 +720,9 @@ final class NativeRegistrationTests: XCTestCase {
         model.proxyConfiguration.enabled = true
         model.proxyConfiguration.entries = [ProxyEntry(host: "offline.invalid", port: 1080)]
         model.start()
-        try await until { attempts >= 3 }
+        try await until { model.phase == "等待可用代理" }
+        XCTAssertEqual(attempts, 1)
+        XCTAssertTrue(model.proxyConfiguration.entries.isEmpty)
         XCTAssertTrue(model.isRunning)
         XCTAssertFalse(model.isPaused)
         XCTAssertNil(model.alert)
@@ -568,29 +731,27 @@ final class NativeRegistrationTests: XCTestCase {
         XCTAssertEqual(model.records.first?.status, .cancelled)
     }
 
-    func testPreflightExhaustionKeepsTaskAliveUntilNewProxyArrives() async throws {
-        let bad = ProxyEntry(host: "bad-preflight.invalid", port: 1080)
-        let added = ProxyEntry(host: "new-preflight.invalid", port: 1080)
+    func testConnectionFailuresKeepTaskAliveUntilNewProxyArrives() async throws {
+        let bad = ProxyEntry(host: "bad-request.invalid", port: 1080)
+        let added = ProxyEntry(host: "new-request.invalid", port: 1080)
         var attempts: [UUID?] = []
         let model = try model(factory: { proxy, _ in
             attempts.append(proxy?.id)
             return { request in
+                if proxy?.id == bad.id { throw URLError(.timedOut) }
                 return self.response(request, request.url!.path == "/api/status" ? self.statusWithoutEmail : #"{"success":true}"#)
             }
-        }, proxyTest: { proxy, _ in
-            .init(verdict: proxy.id == bad.id ? .unreachable : .usable, status: 200,
-                  milliseconds: 10, exit: nil, error: nil)
         })
         defer { model.stop() }
         model.proxyConfiguration.enabled = true; model.proxyConfiguration.entries = [bad]
         model.start()
         try await until { model.proxyConfiguration.entries.isEmpty }
-        XCTAssertTrue(attempts.isEmpty)
+        XCTAssertEqual(attempts, [bad.id])
         XCTAssertTrue(model.isRunning)
         XCTAssertFalse(model.isPaused)
         model.proxyConfiguration.entries.append(added)
         try await until { !model.isRunning }
-        XCTAssertEqual(attempts, [added.id])
+        XCTAssertEqual(attempts, [bad.id, added.id])
         XCTAssertEqual(model.records.first?.status, .succeeded)
         XCTAssertNil(model.alert)
     }

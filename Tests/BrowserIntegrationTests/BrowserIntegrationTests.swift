@@ -22,17 +22,12 @@ final class BrowserIntegrationTests: XCTestCase {
         configuration.enabled = true
         configuration.entries = (0..<2).map { ProxyEntry(host: "fixture\($0).invalid", port: 1080) }
         let record = AccountRecord(username: "fixture176", email: "fixture176@test.invalid")
-        var tested: [UUID] = []
         var attempts: [UUID] = []
         var usernames: [String] = []
         var failures = 0
         try await RegistrationRetry.run(selectProxy: { previous, excluded in
-            let selection = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
-                                                               startingAfter: previous, excluding: excluded, test: { entry in
-                tested.append(entry.id)
-                return ProxyManager.TestResult(verdict: .usable, status: 200, milliseconds: 100, exit: nil, error: nil)
-            }, discard: { _, _ in XCTFail("Both fixture proxies pass preflight") })
-            return selection?.entry
+            try ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
+                                         startingAfter: previous, excluding: excluded)
         }, attempt: { proxy in
             attempts.append(try XCTUnwrap(proxy).id)
             // Local HTML only: no connection is made to the proxy or registration service.
@@ -64,8 +59,7 @@ final class BrowserIntegrationTests: XCTestCase {
             }
             XCTAssertEqual(pane.registration?["success"] as? Bool, true)
         }, shouldRetry: { true }, onRetry: { _, _ in failures += 1 })
-        XCTAssertEqual(tested, configuration.entries.map(\.id))
-        XCTAssertEqual(attempts, tested)
+        XCTAssertEqual(attempts, configuration.entries.map(\.id))
         XCTAssertEqual(usernames, [record.username, record.username])
         XCTAssertEqual(failures, 1)
     }
