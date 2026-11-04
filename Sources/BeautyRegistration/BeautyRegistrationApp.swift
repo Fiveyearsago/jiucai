@@ -32,7 +32,7 @@ struct BeautyRegistrationApp: App {
             CommandGroup(replacing: .newItem) {}
             CommandMenu("任务") {
                 Toggle("使用 Safari 浏览器标识", isOn: $model.useCompatibilityHeaders).disabled(model.isRunning)
-                Button("打开注册页面") { model.openPages() }.disabled(model.isRunning)
+                Button("检查接口连接") { model.checkAPIConnection() }.disabled(model.isRunning || model.isCheckingConnection)
                 Button("导出注册记录…") { model.exportCSV() }.keyboardShortcut("e", modifiers: [.command, .shift])
                 Button("打开记录目录") { model.revealRecords() }
             }

@@ -28,6 +28,7 @@ public enum VerificationRetry {
 
     @MainActor
     public static func send(
+        retryRateLimits: Bool = true,
         attempt: () async throws -> [String: Any],
         wait: (_ seconds: Int, _ retry: Int) async throws -> Void
     ) async throws {
@@ -36,9 +37,9 @@ public enum VerificationRetry {
             try Task.checkCancellation()
             let response = try await attempt()
             if response["success"] as? Bool == true { return }
-            guard let seconds = delay(for: response, retry: retries + 1) else {
+            guard retryRateLimits, let seconds = delay(for: response, retry: retries + 1) else {
                 var message = ServerFailure.describe(response, operation: "发送验证码")
-                if response["status"] as? Int == 429 {
+                if retryRateLimits, response["status"] as? Int == 429 {
                     message += retries == maximumRetries
                         ? "。已自动重试 \(maximumRetries) 次，请稍后再试。"
                         : "。冷却时间超出自动等待范围，请稍后再试。"

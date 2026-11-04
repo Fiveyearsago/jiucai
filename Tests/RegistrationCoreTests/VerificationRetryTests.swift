@@ -2,6 +2,22 @@ import XCTest
 @testable import RegistrationCore
 
 final class VerificationRetryTests: XCTestCase {
+    @MainActor
+    func testProxyFailoverDoesNotWaitOrResendOnSameRateLimitedProxy() async {
+        var attempts = 0
+        do {
+            try await VerificationRetry.send(retryRateLimits: false, attempt: {
+                attempts += 1
+                return ["status": 429, "success": false, "message": "同一 IP 请求过多"]
+            }, wait: { _, _ in XCTFail("Proxy mode must switch immediately") })
+            XCTFail("The registration loop must receive the error and switch proxies")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("HTTP 429"))
+            XCTAssertFalse(error.localizedDescription.contains("冷却时间超出"))
+        }
+        XCTAssertEqual(attempts, 1)
+    }
+
     func testDelayHonorsServerHintsAndGrowsForRepeatedRejections() {
         let limited: [String: Any] = ["status": 429, "success": false, "message": "发送过于频繁，请等待 1 秒后再试"]
         XCTAssertEqual((1...3).compactMap { VerificationRetry.delay(for: limited, retry: $0) }, [5, 10, 20])

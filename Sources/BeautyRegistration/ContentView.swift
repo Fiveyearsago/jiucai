@@ -17,9 +17,9 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 if section == "records" { header }
                 switch section {
-                case "headers": RequestHeadersView(model: model, pane: model.registrationPage)
+                case "headers": RequestHeadersView(model: model, monitor: model.networkMonitor)
                 case "records": records
-                case "network": NetworkInspectorView(pane: model.registrationPage)
+                case "network": NetworkInspectorView(monitor: model.networkMonitor)
                 case "proxy": ProxyConfigurationView(model: model)
                 default: workspace
                 }
@@ -31,6 +31,9 @@ struct ContentView: View {
             Button("已确认未注册，允许重试") { if let id = selectedRecord { model.resolveRecord(id, exists: false) } }
             Button("取消", role: .cancel) {}
         } message: { Text("这里保存你的核对结果，不会再次提交注册。") }
+        .onChange(of: model.configuration.prefix) { _ in refreshFormIfIdle() }
+        .onChange(of: model.configuration.startIndex) { _ in refreshFormIfIdle() }
+        .onChange(of: model.configuration.digits) { _ in refreshFormIfIdle() }
     }
 
     private var sidebar: some View {
@@ -46,14 +49,14 @@ struct ContentView: View {
             VStack(spacing: 5) {
                 nav("workspace", "注册工作台", "rectangle.split.2x1")
                 nav("records", "注册记录", "tray.full", count: model.records.count)
-                nav("network", "网络请求", "network", count: model.registrationPage.networkRecords.count)
+                nav("network", "网络请求", "network", count: model.networkMonitor.networkRecords.count)
                 nav("proxy", "代理池", "arrow.triangle.2.circlepath", count: model.proxyConfiguration.activeEntries.count)
                 nav("headers", "请求头", "slider.horizontal.3")
             }
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("任务配置").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+                    Text("批量任务配置").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
                     input("用户名前缀") { TextField("xiaorange", text: $model.configuration.prefix) }
                     HStack(spacing: 12) {
                         input("起始编号") { TextField("176", value: $model.configuration.startIndex, formatter: integerFormatter) }
@@ -75,7 +78,7 @@ struct ContentView: View {
                     Text(model.passwordStatus).font(.system(size: 11)).foregroundStyle(.secondary)
                     input("邀请码") { TextField("邀请码（可选）", text: $model.configuration.invitation) }
                     input("账号间隔（秒）") { TextField("60", value: $model.configuration.intervalSeconds, formatter: integerFormatter) }
-                    input("429 冷却（分钟，0 = 停止）") { TextField("0", value: $model.configuration.cooldownMinutes, formatter: integerFormatter) }
+                    input("无代理重试间隔（分钟，0 = 默认间隔）") { TextField("0", value: $model.configuration.cooldownMinutes, formatter: integerFormatter) }
                     VStack(alignment: .leading, spacing: 8) {
                         Link("阅读邮箱服务条款 ↗", destination: URL(string: "https://fviainboxes.com/terms")!).font(.caption)
                         Toggle("已阅读并同意邮箱服务条款", isOn: $model.acknowledgedMailboxTerms)
@@ -94,7 +97,7 @@ struct ContentView: View {
                     }
                 } else {
                     Button { section = "workspace"; model.start() } label: {
-                        HStack { Image(systemName: "play.fill"); Text("开始注册"); Spacer(); Image(systemName: "arrow.right") }.padding(.vertical, 4)
+                        HStack { Image(systemName: "play.fill"); Text("开始批量注册"); Spacer(); Image(systemName: "arrow.right") }.padding(.vertical, 4)
                     }.buttonStyle(.borderedProminent).controlSize(.large).disabled(!model.storageAvailable)
                 }
                 if model.isRunning {
@@ -109,6 +112,9 @@ struct ContentView: View {
 
     private var integerFormatter: NumberFormatter {
         let f = NumberFormatter(); f.numberStyle = .none; f.allowsFloats = false; return f
+    }
+    private func refreshFormIfIdle() {
+        if !model.isRunning { model.refreshNativeForm() }
     }
     private func input<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -150,7 +156,7 @@ struct ContentView: View {
                 metric("已成功", value: "\(model.successCount)", symbol: "checkmark.circle")
                 metric("待核对", value: "\(model.uncertainCount)", symbol: "clock.badge.questionmark")
             }
-            browserArea
+            nativeRegistrationArea
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: "text.alignleft").foregroundStyle(accent)
                 VStack(alignment: .leading, spacing: 5) {
@@ -181,39 +187,145 @@ struct ContentView: View {
         }.padding(18).frame(maxWidth: .infinity).background(.white, in: RoundedRectangle(cornerRadius: 13))
     }
 
-    private var browserArea: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Picker("网页", selection: $model.tab) {
-                    Text("注册页面").tag("registration")
-                    Text("邮箱收件箱").tag("mailbox")
-                }.pickerStyle(.segmented).frame(width: 240)
-                Spacer()
-                if model.isRunning && model.step == 3 {
-                    TextField("手动输入 6 位验证码", text: $model.manualCode)
-                        .textFieldStyle(.roundedBorder).frame(width: 166)
-                }
-                Text(model.tab == "registration" ? "api.jiucaihezi.studio" : "fviainboxes.com")
-                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
-                Button { model.openPages() } label: { Image(systemName: "arrow.clockwise") }
-                    .help("打开或重新载入网页").disabled(model.isRunning)
-            }.padding(12).background(Color.white)
-            Divider()
-            ZStack {
-                BrowserSurface(pane: model.registrationPage).opacity(model.tab == "registration" ? 1 : 0).allowsHitTesting(model.tab == "registration")
-                BrowserSurface(pane: model.mailboxPage).opacity(model.tab == "mailbox" ? 1 : 0).allowsHitTesting(model.tab == "mailbox")
-                if !model.pagesOpened && !model.isRunning {
-                    VStack(spacing: 15) {
-                        Image(systemName: "rectangle.on.rectangle").font(.system(size: 40, weight: .ultraLight)).foregroundStyle(accent)
-                        Text("注册与验证，在一个窗口完成").font(.system(size: 17, weight: .medium))
-                        Text("点击开始后自动打开网页，也可以先检查页面。")
+    private var nativeRegistrationArea: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("注册账号").font(.system(size: 24, weight: .semibold))
+                        Text("填写注册信息，获取验证码后完成注册。")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
-                        Button("打开页面") { model.openPages() }.controlSize(.large)
-                    }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color.white)
+                    }
+                    Spacer()
+                    if model.isRunning {
+                        Label(model.isManualFlow ? "单个账号" : "批量任务", systemImage: model.isManualFlow ? "person" : "person.2")
+                            .font(.system(size: 11, weight: .medium)).foregroundStyle(accent)
+                            .padding(.horizontal, 11).padding(.vertical, 7)
+                            .background(accent.opacity(0.08), in: Capsule())
+                    }
                 }
-            }.frame(maxWidth: .infinity, maxHeight: .infinity)
-        }.background(.white).clipShape(RoundedRectangle(cornerRadius: 13))
+
+                HStack(spacing: 9) {
+                    registrationStep(1, title: "填写注册信息")
+                    Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    registrationStep(2, title: "请求验证码")
+                    Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    registrationStep(3, title: "输入验证码")
+                    Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    registrationStep(4, title: "注册用户")
+                    Spacer(minLength: 0)
+                }
+
+                HStack(alignment: .center, spacing: 18) {
+                    connectionStatus("接口连接", value: model.siteStatusDescription, symbol: "network")
+                    Divider().frame(height: 30)
+                    connectionStatus("当前代理", value: model.activeProxyDescription, symbol: "arrow.triangle.2.circlepath")
+                    Spacer(minLength: 0)
+                    Button { model.checkAPIConnection() } label: {
+                        HStack(spacing: 6) {
+                            if model.isCheckingConnection { ProgressView().controlSize(.small) }
+                            Text(model.isCheckingConnection ? "正在检查" : "检查连接")
+                        }
+                    }.disabled(model.isRunning || model.isCheckingConnection)
+                }.padding(14).background(canvas, in: RoundedRectangle(cornerRadius: 10))
+
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(alignment: .top, spacing: 20) {
+                        input("用户名") { TextField("输入用户名", text: $model.formUsername) }
+                        input("邮箱地址") { TextField("name@fviainboxes.com", text: $model.formEmail) }
+                    }
+                    HStack(alignment: .top, spacing: 20) {
+                        input("注册密码") { SecureField("输入 8–128 位密码", text: $model.password) }
+                        input("邀请码") { TextField("邀请码（可选）", text: $model.configuration.invitation) }
+                    }
+                    Text(model.passwordStatus).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Toggle("自动读取临时邮箱验证码", isOn: $model.autoReadMailbox)
+                        .toggleStyle(.checkbox).font(.system(size: 12))
+                    Text(model.autoReadMailbox ? "收到邮件后自动填入验证码，也可以手动输入。" : "请查看邮箱中的验证邮件，并手动输入验证码。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }.disabled(model.isRunning)
+
+                Divider()
+
+                HStack(alignment: .bottom, spacing: 12) {
+                    input("邮箱验证码") {
+                        TextField("输入 6 位验证码", text: $model.manualCode)
+                            .font(.system(size: 14, design: .monospaced))
+                            .disabled(!model.waitingForCode)
+                    }.frame(maxWidth: 240)
+                    Button { model.requestNativeVerification() } label: {
+                        HStack(spacing: 7) {
+                            if model.isRunning && model.isManualFlow && !model.verificationSent {
+                                ProgressView().controlSize(.small)
+                            }
+                            Text("请求验证码")
+                        }
+                    }.controlSize(.large).disabled(model.isRunning || !model.storageAvailable)
+                    Spacer()
+                    Button { model.submitNativeRegistration() } label: {
+                        Label("注册用户", systemImage: "person.badge.plus")
+                            .padding(.horizontal, 9)
+                    }.buttonStyle(.borderedProminent).controlSize(.large)
+                        .disabled(!model.canSubmitNativeRegistration)
+                }
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: model.verificationSent ? "envelope.badge" : "info.circle")
+                        .foregroundStyle(accent)
+                    Text(verificationHint).font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if model.isRunning {
+                    HStack(alignment: .top, spacing: 9) {
+                        ProgressView().controlSize(.small)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(model.phase).font(.system(size: 12, weight: .medium))
+                            Text(model.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(13).background(accent.opacity(0.06), in: RoundedRectangle(cornerRadius: 9))
+                }
+            }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(.white, in: RoundedRectangle(cornerRadius: 13))
             .overlay(RoundedRectangle(cornerRadius: 13).stroke(ink.opacity(0.08), lineWidth: 1))
+    }
+
+    private var currentFormStep: Int {
+        if model.verificationSent {
+            return model.waitingForCode ? 3 : 4
+        }
+        return model.isRunning ? 2 : 1
+    }
+
+    private var verificationHint: String {
+        if model.verificationSent {
+            if !model.isRunning { return "本次流程已结束。可修改注册信息后，再次请求验证码。" }
+            if model.isRunning && !model.isManualFlow { return "批量任务会在取得验证码后自动完成注册。需要时可在此手动补填。" }
+            return model.waitingForCode ? "验证码已发送。确认验证码后，点击「注册用户」完成注册。" : "验证码已就绪，正在完成注册。"
+        }
+        return "先请求验证码，再填写收到的 6 位验证码。单个账号需点击「注册用户」提交。"
+    }
+
+    private func registrationStep(_ number: Int, title: String) -> some View {
+        HStack(spacing: 7) {
+            Text("\(number)").font(.system(size: 10, weight: .semibold, design: .rounded))
+                .frame(width: 21, height: 21)
+                .background(number == currentFormStep ? accent : accent.opacity(0.08), in: Circle())
+                .foregroundStyle(number == currentFormStep ? .white : accent)
+            Text(title).font(.system(size: 11, weight: number == currentFormStep ? .semibold : .regular))
+                .foregroundStyle(number == currentFormStep ? ink : .secondary)
+        }
+    }
+
+    private func connectionStatus(_ title: String, value: String, symbol: String) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: symbol).font(.system(size: 15)).foregroundStyle(accent)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(value).font(.system(size: 11, weight: .medium)).lineLimit(1).help(value)
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var records: some View {
@@ -300,7 +412,7 @@ private struct AccountRecordInspector: View {
                     }, keyColor: .secondary)
                 }
                 if let path = record.screenshot, let image = NSImage(contentsOfFile: path) {
-                    Text("注册截图").font(.system(size: 13, weight: .semibold))
+                    Text("历史注册截图").font(.system(size: 13, weight: .semibold))
                     Image(nsImage: image).resizable().aspectRatio(contentMode: .fit).frame(maxWidth: 520)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
@@ -313,9 +425,9 @@ private struct NetworkRequestRow: View {
     let record: NetworkRecord
     var body: some View {
         HStack(spacing: 8) {
-            Text("\(record.status)")
+            Text(record.status == 0 ? "连接失败" : "\(record.status)")
                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .frame(width: 34).padding(.vertical, 2)
+                .frame(width: 50).padding(.vertical, 2)
                 .background(statusColor(record.status).opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
                 .foregroundStyle(statusColor(record.status))
             VStack(alignment: .leading, spacing: 2) {
@@ -327,7 +439,7 @@ private struct NetworkRequestRow: View {
     }
 }
 
-/// Safari Web Inspector–style 摘要 / 请求 / 响应 view for one request.
+/// Summary, request headers, and response details for one API request.
 private struct NetworkRecordDetail: View {
     let record: NetworkRecord
     var body: some View {
@@ -335,14 +447,14 @@ private struct NetworkRecordDetail: View {
             VStack(alignment: .leading, spacing: 18) {
                 var summary: [(String, String)] {
                     var rows = [("URL", "https://api.jiucaihezi.studio" + record.path), ("方法", record.method),
-                                ("状态", "\(record.status)"), ("来源", record.transport),
+                                ("状态", record.status == 0 ? "连接失败" : "\(record.status)"), ("来源", record.transport),
                                 ("时间", record.date.formatted(date: .abbreviated, time: .standard))]
                     if let retry = record.retryAfter { rows.append(("Retry-After", retry)) }
                     return rows
                 }
                 inspectorSection("摘要", rows: summary, keyColor: .green)
                 inspectorSection("请求", rows: record.requestHeaders.map { ($0.name, $0.value) }, keyColor: .blue,
-                                 empty: "网页脚本未设置请求头。浏览器自动添加的 Cookie、Sec-Fetch-* 等字段请用 Safari 网页检查器查看。")
+                                 empty: "此请求没有记录可显示的请求头。")
                 inspectorSection("响应", rows: record.responseHeaders.map { ($0.name, $0.value) }, keyColor: .blue,
                                  empty: "没有可读取的响应头。")
                 if !record.responseBody.isEmpty {
@@ -384,18 +496,18 @@ private func inspectorSection(_ title: String, rows: [(String, String)], keyColo
 
 private struct RequestHeadersView: View {
     @ObservedObject var model: RegistrationModel
-    @ObservedObject var pane: BrowserPane
+    @ObservedObject var monitor: RequestMonitor
 
     @State private var selectedRequest: UUID?
     @State private var newHeaderName = ""
     @State private var newHeaderValue = ""
-    private var displayed: RequestHeaderConfiguration { pane.appliedHeaders ?? model.headerConfiguration }
+    private var displayed: RequestHeaderConfiguration { monitor.appliedHeaders ?? model.headerConfiguration }
     private var observation: RequestHeaderObservation? {
-        pane.requestObservations.first(where: { $0.id == selectedRequest }) ?? pane.requestObservations.first
+        monitor.requestObservations.first(where: { $0.id == selectedRequest }) ?? monitor.requestObservations.first
     }
     private var userAgent: String {
-        if pane.appliedHeaders == nil, let agent = displayed.mode.userAgent { return agent }
-        return pane.currentUserAgent.isEmpty ? (displayed.mode.userAgent ?? "等待浏览器提供") : pane.currentUserAgent
+        if monitor.appliedHeaders == nil, let agent = displayed.mode.userAgent { return agent }
+        return monitor.currentUserAgent.isEmpty ? (displayed.mode.userAgent ?? "系统默认") : monitor.currentUserAgent
     }
 
     var body: some View {
@@ -404,7 +516,7 @@ private struct RequestHeadersView: View {
                 HStack {
                     Text("请求头").font(.system(size: 25, weight: .semibold))
                     Spacer()
-                    Label(pane.appliedHeaderMode == nil ? "待打开页面" : "已应用到注册页", systemImage: pane.appliedHeaderMode == nil ? "clock" : "checkmark.circle")
+                    Label(monitor.appliedHeaderMode == nil ? "等待请求" : "已应用到接口请求", systemImage: monitor.appliedHeaderMode == nil ? "clock" : "checkmark.circle")
                         .font(.system(size: 11)).foregroundStyle(accent)
                         .padding(.horizontal, 12).padding(.vertical, 8)
                         .background(accent.opacity(0.08), in: Capsule())
@@ -412,7 +524,7 @@ private struct RequestHeadersView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     HStack {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(pane.appliedHeaders == nil ? "下次使用的配置" : "当前页面配置").font(.system(size: 11)).foregroundStyle(.secondary)
+                            Text(monitor.appliedHeaders == nil ? "下次使用的配置" : "最近请求的配置").font(.system(size: 11)).foregroundStyle(.secondary)
                             Text(displayed.mode.title).font(.system(size: 18, weight: .semibold))
                         }
                         Spacer()
@@ -421,14 +533,14 @@ private struct RequestHeadersView: View {
                     Divider()
                     headerRow("User-Agent", value: userAgent)
                     Divider()
-                    headerRow("Accept", value: displayed.accept.value ?? "网页默认（未覆盖）")
+                    headerRow("Accept", value: displayed.accept.value ?? "原生默认（未覆盖）")
                     Divider()
-                    headerRow("Accept-Language", value: displayed.language.value ?? "网页 / 浏览器默认（未覆盖）")
+                    headerRow("Accept-Language", value: displayed.language.value ?? "系统默认（未覆盖）")
                 }.padding(24).background(.white, in: RoundedRectangle(cornerRadius: 13))
                 VStack(alignment: .leading, spacing: 14) {
                     Text("兼容配置").font(.system(size: 16, weight: .semibold))
                     HStack(alignment: .top, spacing: 24) {
-                        Picker("浏览器标识", selection: $model.headerConfiguration.mode) {
+                        Picker("请求标识", selection: $model.headerConfiguration.mode) {
                             ForEach(RequestHeaderMode.allCases) { Text($0.title).tag($0) }
                         }
                         Picker("语言偏好", selection: $model.headerConfiguration.language) {
@@ -450,11 +562,11 @@ private struct RequestHeadersView: View {
                     }
                     if model.isRunning {
                         Text("任务运行期间保持当前配置。").font(.system(size: 12)).foregroundStyle(.secondary)
-                    } else if let applied = pane.appliedHeaders, applied != model.headerConfiguration {
-                        Text("已保存新配置，下次打开页面或开始任务时生效。当前页面仍使用：\(applied.title)。")
+                    } else if let applied = monitor.appliedHeaders, applied != model.headerConfiguration {
+                        Text("已保存新配置，下次请求时生效。最近请求使用：\(applied.title)。")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                     } else {
-                        Text("配置自动保存，下次打开页面或开始任务时生效。语言与格式用于发送验证码、提交注册接口；语言也用于打开注册页。")
+                        Text("配置自动保存，用于检查连接、请求验证码和提交注册。")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                 }.padding(24).background(.white, in: RoundedRectangle(cornerRadius: 13))
@@ -503,12 +615,12 @@ private struct RequestHeadersView: View {
                     HStack {
                         Text("请求详情").font(.system(size: 16, weight: .semibold))
                         Spacer()
-                        Text("最近 \(pane.requestObservations.count) 条 · 仅本次运行").font(.caption).foregroundStyle(.secondary)
+                        Text("最近 \(monitor.requestObservations.count) 条 · 仅本次运行").font(.caption).foregroundStyle(.secondary)
                     }
                     if let observation {
                         Picker("查看请求", selection: $selectedRequest) {
                             Text("最新请求").tag(nil as UUID?)
-                            ForEach(pane.requestObservations) { item in
+                            ForEach(monitor.requestObservations) { item in
                                 Text("\(item.date.formatted(date: .omitted, time: .standard))  \(item.method) \(item.path)").tag(Optional(item.id))
                             }
                         }
@@ -529,17 +641,16 @@ private struct RequestHeadersView: View {
                             }
                         }
                     } else {
-                        Text("尚未观测到请求。打开注册页面后，这里会显示实际发生的导航和注册相关接口请求。")
+                        Text("尚无请求。检查连接、请求验证码或提交注册后，这里会显示实际发送的接口请求。")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                 }.padding(24).frame(maxWidth: .infinity, alignment: .leading).background(.white, in: RoundedRectangle(cornerRadius: 13))
-                Text("详情记录网页设置及 WebKit 暴露的字段，并非完整网络抓包；浏览器自动添加但未暴露的字段不作推测。仅保留所列非敏感字段，网址查询参数、Cookie、Authorization 和请求正文不进入记录。")
+                Text("详情显示接口请求及所使用的请求头配置。仅保留所列非敏感字段，网址查询参数、Cookie、Authorization 和请求正文不进入记录。")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }.padding(28)
         }
-        .task { await pane.refreshUserAgent() }
-        .onChange(of: pane.requestObservations.map(\.id)) { ids in
+        .onChange(of: monitor.requestObservations.map(\.id)) { ids in
             if let selectedRequest, !ids.contains(selectedRequest) { self.selectedRequest = nil }
         }
     }
@@ -558,36 +669,32 @@ private struct ProxyConfigurationView: View {
     @ObservedObject var model: RegistrationModel
     @State private var pasteText = ""
     @State private var parseError = ""
-    @State private var testResults: [UUID: ProxyManager.TestResult] = [:]
-    @State private var testing: Set<UUID> = []
     @State private var selectedProxies: Set<UUID> = []
 
-    private func test(_ entries: [ProxyEntry]) {
-        for entry in entries where !testing.contains(entry.id) {
-            testing.insert(entry.id)
-            Task {
-                let result = await ProxyManager.test(entry)
-                testResults[entry.id] = result
-                testing.remove(entry.id)
-            }
-        }
-    }
     private func resultColor(_ verdict: ProxyManager.TestResult.Verdict) -> Color {
         switch verdict { case .usable: return accent; case .blocked: return .orange; case .unreachable: return .red }
     }
 
+    private var millisecondsFormatter: NumberFormatter {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .none
+        formatter.allowsFloats = false
+        formatter.usesGroupingSeparator = false
+        return formatter
+    }
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
+            LazyVStack(alignment: .leading, spacing: 22) {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("代理池").font(.system(size: 25, weight: .semibold))
-                        Text("每个账号注册前自动应用代理，防止同一 IP 触发频率限制。")
+                        Text("每个账号使用前复测代理；接口无法连接或注册出错时，自动换下一个代理重试当前账号。")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Toggle("启用代理", isOn: $model.proxyConfiguration.enabled)
-                        .toggleStyle(.switch).disabled(model.isRunning)
+                        .toggleStyle(.switch).disabled(model.isRunning || model.isTestingProxies)
                 }
 
                 // Paste import
@@ -611,12 +718,13 @@ private struct ProxyConfigurationView: View {
                             } else {
                                 parseError = ""
                                 model.proxyConfiguration.entries.append(contentsOf: parsed)
+                                model.saveProxyLatencyLimits()
                                 pasteText = ""
                             }
-                        }.disabled(pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isRunning)
+                        }.disabled(pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.storageAvailable || model.isTestingProxies)
                         Button("清空列表") {
                             model.proxyConfiguration.entries.removeAll()
-                        }.foregroundStyle(.red.opacity(0.8)).disabled(model.proxyConfiguration.entries.isEmpty || model.isRunning)
+                        }.foregroundStyle(.red.opacity(0.8)).disabled(model.proxyConfiguration.entries.isEmpty || model.isRunning || model.isTestingProxies)
                     }
                 }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 13))
 
@@ -629,13 +737,46 @@ private struct ProxyConfigurationView: View {
                             let f = NumberFormatter(); f.numberStyle = .none; f.allowsFloats = false; return f
                         }()).frame(width: 60).textFieldStyle(.roundedBorder)
                         Text("个账号切换一次代理").font(.system(size: 13))
-                    }.disabled(model.isRunning)
+                    }.disabled(model.isRunning || model.isTestingProxies)
                     Text("代理按列表顺序循环使用，完成 switchEvery 个账号后切换到下一个。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 13))
 
-                // Proxy list
                 VStack(alignment: .leading, spacing: 10) {
+                    Text("测速门槛与请求超时").font(.system(size: 14, weight: .semibold))
+                    HStack(spacing: 28) {
+                        HStack(spacing: 8) {
+                            Text("批量测试")
+                            TextField("3000", value: $model.proxyConfiguration.poolTestLimitMilliseconds, formatter: millisecondsFormatter)
+                                .frame(width: 90).textFieldStyle(.roundedBorder)
+                            Text("ms")
+                        }
+                        HStack(spacing: 8) {
+                            Text("使用前测速")
+                            TextField("5000", value: $model.proxyConfiguration.preflightTestLimitMilliseconds, formatter: millisecondsFormatter)
+                                .frame(width: 90).textFieldStyle(.roundedBorder)
+                            Text("ms")
+                        }
+                    }.font(.system(size: 13)).disabled(model.isRunning || model.isTestingProxies)
+                    Text("任务运行期间可以补充代理。代理全部不可用时，任务保持运行，添加代理后自动继续。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text("批量测试超过门槛自动删除；使用前测速须低于门槛，否则删除并尝试下一个。请输入大于 0 的整数，设置自动保存。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Text("接口请求超时")
+                        TextField("10", value: $model.proxyConfiguration.pageLoadingTimeoutSeconds, formatter: millisecondsFormatter)
+                            .frame(width: 90).textFieldStyle(.roundedBorder)
+                        Text("秒")
+                    }.font(.system(size: 13)).disabled(model.isRunning || model.isTestingProxies)
+                    Text("接口请求超过 \(model.proxyConfiguration.pageLoadingTimeoutSeconds) 秒未完成，自动删除当前代理并尝试下一个。等待邮件验证码不计入此时间。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    if let error = model.proxyLatencyError {
+                        Text(error).font(.caption).foregroundStyle(.red)
+                    }
+                }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 13))
+
+                // Proxy list
+                LazyVStack(alignment: .leading, spacing: 10) {
                     HStack {
                         Text("代理列表  \(model.proxyConfiguration.entries.count)").font(.system(size: 14, weight: .semibold))
                         Spacer()
@@ -644,13 +785,30 @@ private struct ProxyConfigurationView: View {
                             Button("删除选中 (\(selectedProxies.count))") {
                                 model.proxyConfiguration.entries.removeAll { selectedProxies.contains($0.id) }
                                 selectedProxies.removeAll()
-                            }.foregroundStyle(.red.opacity(0.8)).disabled(model.isRunning)
+                            }.foregroundStyle(.red.opacity(0.8)).disabled(model.isRunning || model.isTestingProxies)
                         }
-                        Button(testing.isEmpty ? "全部测试" : "测试中…") { test(model.proxyConfiguration.entries) }
-                            .disabled(model.proxyConfiguration.entries.isEmpty || !testing.isEmpty)
+                        Picker("测试并发", selection: $model.proxyTestConcurrency) {
+                            ForEach(1...ProxyManager.maximumBatchConcurrency, id: \.self) { Text("\($0) 个").tag($0) }
+                        }.frame(width: 140).disabled(model.isRunning || model.isTestingProxies)
+                        if model.isTestingProxies {
+                            Button("停止测试") { model.stopProxyTests() }
+                        } else {
+                            Button("全部测试") { model.testProxies(model.proxyConfiguration.entries) }
+                                .disabled(model.proxyConfiguration.entries.isEmpty || model.isRunning || model.proxyLatencyError != nil)
+                        }
                     }
-                    Text("测试会经该代理打开注册页 api.jiucaihezi.studio/sign-up，并读取网站看到的出口 IP 与 Cloudflare 节点。")
+                    Text("默认同时测试 \(ProxyManager.defaultBatchConcurrency) 个，最多 \(ProxyManager.maximumBatchConcurrency) 个；其余排队，排队时间不计入延时，网络较慢时可调为 1 个。测试超过 \(model.proxyConfiguration.poolTestLimitMilliseconds) ms 或不可用的代理会自动删除。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text("测速只检查接口连接；每次使用前再单独复测，低于 \(model.proxyConfiguration.preflightTestLimitMilliseconds) ms 才使用，否则删除并继续尝试下一个。复测通过后读取出口 IP。开始注册会先停止批量测试。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    if model.proxyTestsTotal > 0 {
+                        HStack(spacing: 12) {
+                            ProgressView(value: Double(model.proxyTestsCompleted), total: Double(model.proxyTestsTotal))
+                                .frame(maxWidth: 220)
+                            Text("已测 \(model.proxyTestsCompleted)/\(model.proxyTestsTotal) · 已丢弃 \(model.proxyTestsDiscarded)")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                    }
                     if model.proxyConfiguration.entries.isEmpty {
                         Text("列表为空，粘贴代理后点「添加到列表」。")
                             .font(.system(size: 12)).foregroundStyle(.secondary).padding(.vertical, 8)
@@ -665,47 +823,53 @@ private struct ProxyConfigurationView: View {
                                     Image(systemName: selectedProxies.contains(entry.id) ? "checkmark.square.fill" : "square")
                                         .foregroundStyle(selectedProxies.contains(entry.id) ? accent : Color.secondary.opacity(0.5))
                                 }.buttonStyle(.plain)
-                                Toggle("", isOn: $entry.enabled).labelsHidden().disabled(model.isRunning)
+                                Toggle("", isOn: $entry.enabled).labelsHidden().disabled(model.isRunning || model.isTestingProxies)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(verbatim: "\(entry.host):\(entry.port)").font(.system(size: 12, design: .monospaced))
                                     if !entry.user.isEmpty {
                                         Text(verbatim: entry.user).font(.system(size: 10)).foregroundStyle(.secondary)
                                     }
-                                    if testing.contains(entry.id) {
-                                        HStack(spacing: 6) { ProgressView().controlSize(.mini); Text("正在测试…") }
+                                    if model.proxyTestPending.contains(entry.id) {
+                                        Text("排队 / 测试中…")
                                             .font(.system(size: 11)).foregroundStyle(.secondary)
-                                    } else if let result = testResults[entry.id] {
+                                    } else if let result = model.proxyTestResults[entry.id] {
                                         Text(verbatim: result.summary).font(.system(size: 11, weight: .medium))
                                             .foregroundStyle(resultColor(result.verdict)).textSelection(.enabled)
                                     }
                                 }
                                 Spacer()
-                                Button("测试") { test([entry]) }.disabled(testing.contains(entry.id))
+                                Button("测试") { model.testProxies([entry]) }.disabled(model.isRunning || model.isTestingProxies || model.proxyLatencyError != nil)
                                 Button {
                                     model.proxyConfiguration.entries.removeAll { $0.id == entry.id }
                                 } label: {
                                     Image(systemName: "minus.circle.fill").foregroundStyle(.red.opacity(0.6))
-                                }.buttonStyle(.plain).disabled(model.isRunning)
+                                }.buttonStyle(.plain).disabled(model.isRunning || model.isTestingProxies)
                             }.padding(.vertical, 4)
                             Divider()
                         }
                     }
                 }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 13))
 
-                Text("代理通过修改系统 SOCKS5 偏好设置生效，每次注册完成后自动清除。仅影响注册期间的网络请求。密码以明文存储在本地记录文件中，请勿在共享设备上使用。")
+                Text("代理功能需要 macOS 14 或更高版本。代理密码以明文存储在本地记录文件中，请勿在共享设备上使用。")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }.padding(28)
         }
+        .onChange(of: model.proxyConfiguration.entries.count) { _ in
+            selectedProxies.formIntersection(model.proxyConfiguration.entries.map(\.id))
+        }
+        .onChange(of: model.proxyConfiguration.poolTestLimitMilliseconds) { _ in model.saveProxyLatencyLimits() }
+        .onChange(of: model.proxyConfiguration.preflightTestLimitMilliseconds) { _ in model.saveProxyLatencyLimits() }
+        .onChange(of: model.proxyConfiguration.pageLoadingTimeoutSeconds) { _ in model.saveProxyLatencyLimits() }
     }
 }
 
 private struct NetworkInspectorView: View {
-    @ObservedObject var pane: BrowserPane
+    @ObservedObject var monitor: RequestMonitor
     @State private var selectedID: UUID?
 
     private var selected: NetworkRecord? {
-        pane.networkRecords.first(where: { $0.id == selectedID }) ?? pane.networkRecords.first
+        monitor.networkRecords.first(where: { $0.id == selectedID }) ?? monitor.networkRecords.first
     }
 
     var body: some View {
@@ -714,22 +878,22 @@ private struct NetworkInspectorView: View {
                 HStack {
                     Text("网络请求").font(.system(size: 14, weight: .semibold))
                     Spacer()
-                    Text("最近 \(pane.networkRecords.count) 条").font(.caption).foregroundStyle(.secondary)
-                    Button { pane.clearNetworkRecords() } label: {
+                    Text("最近 \(monitor.networkRecords.count) 条").font(.caption).foregroundStyle(.secondary)
+                    Button { monitor.clearNetworkRecords() } label: {
                         Image(systemName: "trash").font(.caption)
                     }.help("清空记录").buttonStyle(.plain).foregroundStyle(.secondary)
                 }.padding(.horizontal, 16).padding(.vertical, 10)
                 Divider()
-                if pane.networkRecords.isEmpty {
-                    Text("尚无请求记录。打开注册页面后，这里会显示页面导航和接口请求。")
+                if monitor.networkRecords.isEmpty {
+                    Text("尚无请求记录。检查连接、请求验证码或提交注册后，这里会显示实际发生的接口请求。")
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                         .padding(20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 } else {
-                    List(pane.networkRecords, selection: $selectedID) { NetworkRequestRow(record: $0).tag($0.id) }
+                    List(monitor.networkRecords, selection: $selectedID) { NetworkRequestRow(record: $0).tag($0.id) }
                         .listStyle(.plain)
                 }
                 Divider()
-                Text("需要 Cookie、Sec-Fetch-* 等浏览器自动添加的字段时：Safari › 开发 › 本机 › 注册页面，打开完整网页检查器。")
+                Text("记录显示请求时间与响应状态。选择请求可查看详情。")
                     .font(.system(size: 10)).foregroundStyle(.secondary).padding(12)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -742,22 +906,5 @@ private struct NetworkInspectorView: View {
             }
         }
         .background(canvas)
-    }
-}
-
-private struct BrowserSurface: View {
-    @ObservedObject var pane: BrowserPane
-    var body: some View {
-        ZStack(alignment: .top) {
-            EmbeddedBrowser(pane: pane).id(pane.webViewID)
-            if pane.loading {
-                HStack(spacing: 8) { ProgressView().controlSize(.small); Text("正在加载网页…").font(.caption) }
-                    .padding(10).background(.regularMaterial, in: Capsule()).padding(.top, 12)
-            }
-            if let error = pane.navigationError {
-                Text(error).font(.caption).padding(12).frame(maxWidth: .infinity)
-                    .background(Color.orange.opacity(0.14))
-            }
-        }
     }
 }

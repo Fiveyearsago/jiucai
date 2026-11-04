@@ -7,8 +7,8 @@ public struct TaskConfiguration: Codable, Equatable {
     public var digits = 3
     public var invitation = "WAI1"
     public var intervalSeconds = 60
-    /// Minutes to wait after a 429 error before automatically retrying.
-    /// 0 = do not auto-retry (stop on 429, original behaviour).
+    /// Minutes to wait before retrying a failed direct registration. 0 = default retry delay.
+    /// When proxies are enabled, failures immediately try the next proxy instead.
     public var cooldownMinutes = 0
     // Preserve the previous single-proxy settings when older journals are opened.
     // The new proxy configuration is managed independently and remains disabled by default.
@@ -63,7 +63,7 @@ public struct TaskConfiguration: Codable, Equatable {
         }
         guard (8...128).contains(password.count) else { throw ClientError.message("密码长度需为 8–128 位。") }
         guard (3...3600).contains(intervalSeconds) else { throw ClientError.message("账号间隔需在 3–3600 秒之间。") }
-        guard (0...60).contains(cooldownMinutes) else { throw ClientError.message("429 冷却时间需在 0–60 分钟之间。") }
+        guard (0...60).contains(cooldownMinutes) else { throw ClientError.message("无代理重试冷却时间需在 0–60 分钟之间。") }
         guard invitation.count <= 64 else { throw ClientError.message("邀请码过长。") }
     }
 }
@@ -124,11 +124,40 @@ public struct ProxyEntry: Codable, Equatable, Identifiable {
 /// Proxy pool configuration stored alongside the journal.
 public struct ProxyConfiguration: Codable, Equatable {
     public var entries: [ProxyEntry] = []
-    /// Switch to the next proxy after this many successfully completed accounts. 0 = don't rotate.
+    /// Switch to the next proxy after this many processed accounts; failures advance immediately.
     public var switchEvery: Int = 1
     public var enabled: Bool = false
+    public var poolTestLimitMilliseconds: Int = 3_000
+    public var preflightTestLimitMilliseconds: Int = 5_000
+    /// Native API request timeout. The legacy property and coding key are retained.
+    public var pageLoadingTimeoutSeconds: Int = 10
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case entries, switchEvery, enabled, poolTestLimitMilliseconds, preflightTestLimitMilliseconds
+        case pageLoadingTimeoutSeconds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        entries = try values.decode([ProxyEntry].self, forKey: .entries)
+        switchEvery = try values.decode(Int.self, forKey: .switchEvery)
+        enabled = try values.decode(Bool.self, forKey: .enabled)
+        poolTestLimitMilliseconds = try values.decodeIfPresent(Int.self, forKey: .poolTestLimitMilliseconds) ?? 3_000
+        preflightTestLimitMilliseconds = try values.decodeIfPresent(Int.self, forKey: .preflightTestLimitMilliseconds) ?? 5_000
+        pageLoadingTimeoutSeconds = try values.decodeIfPresent(Int.self, forKey: .pageLoadingTimeoutSeconds) ?? 10
+    }
+
+    public func validateLatencyLimits() throws {
+        guard poolTestLimitMilliseconds > 0 else { throw ClientError.message("批量测速门槛须为大于 0 的整数（ms）。") }
+        guard preflightTestLimitMilliseconds > 0 else { throw ClientError.message("使用前测速门槛须为大于 0 的整数（ms）。") }
+        try validatePageLoadingTimeout()
+    }
+
+    public func validatePageLoadingTimeout() throws {
+        guard pageLoadingTimeoutSeconds > 0 else { throw ClientError.message("接口请求超时须为大于 0 的整数（秒）。") }
+    }
 
     public var activeEntries: [ProxyEntry] { entries.filter(\.enabled) }
 
@@ -163,10 +192,11 @@ public struct AccountRecord: Codable, Identifiable, Equatable {
     public var status: RecordStatus
     public var updatedAt: Date
     public var note: String
+    /// Optional screenshot retained from historical browser-based registrations.
     public var screenshot: String?
     /// Step-by-step log entries appended during registration.
     public var logs: [String]
-    /// Requests observed on the registration page while this account was running.
+    /// API requests recorded while this account was running; older records may include page requests.
     public var network: [NetworkRecord]
     public init(username: String, email: String, status: RecordStatus = .pending) {
         id = UUID(); self.username = username; self.email = email; self.status = status
@@ -201,7 +231,7 @@ public struct NetworkHeader: Codable, Equatable, Identifiable {
     }
 }
 
-/// One request/response pair, redacted by the page bridge: path only (no query
+/// One redacted request/response pair: path only (no query
 /// string), no request body, no Cookie / Authorization / Set-Cookie.
 public struct NetworkRecord: Codable, Equatable, Identifiable {
     public var id = UUID()

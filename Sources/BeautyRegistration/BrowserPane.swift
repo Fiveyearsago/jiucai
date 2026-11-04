@@ -9,6 +9,8 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
     let allowedHost: String
     @Published var loading = false
     @Published var navigationError: String?
+    @Published private(set) var loadingTimeoutError: PageLoadTimeout?
+    var loadingTimeout: TimeInterval
     @Published private(set) var appliedHeaderMode: RequestHeaderMode?
     @Published private(set) var appliedHeaders: RequestHeaderConfiguration?
     @Published private(set) var currentUserAgent = ""
@@ -23,9 +25,14 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
     var onNetworkRecord: ((NetworkRecord) -> Void)?
     private var documentID = UUID().uuidString
     private var compatibilityHeaders = false
+    private var loadingTimeoutTask: Task<Void, Never>?
+    private var activeLoadID: UUID?
+    private var activeNavigation: WKNavigation?
+    private var retiredNavigations: [WKNavigation] = []
 
-    init(host: String) {
+    init(host: String, loadingTimeout: TimeInterval = PageLoadTimeout.defaultSeconds) {
         allowedHost = host
+        self.loadingTimeout = loadingTimeout
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
@@ -48,11 +55,77 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
     func load(_ url: URL, headers: RequestHeaderConfiguration) {
         guard url.scheme == "https", url.host == allowedHost else { return }
         configureHeaders(headers)
-        verification = nil; registration = nil; navigationError = nil; loading = true
+        stopLoading()
+        verification = nil; registration = nil; navigationError = nil; loadingTimeoutError = nil
+        beginLoading()
         installBridge()
-        var request = URLRequest(url: url, timeoutInterval: 120)
+        var request = URLRequest(url: url, timeoutInterval: effectiveLoadingTimeout)
         if let language = appliedHeaders?.language.value { request.setValue(language, forHTTPHeaderField: "Accept-Language") }
-        webView.load(request)
+        trackNavigation(webView.load(request))
+    }
+
+    private var effectiveLoadingTimeout: TimeInterval {
+        loadingTimeout.isFinite && loadingTimeout > 0 ? loadingTimeout : PageLoadTimeout.defaultSeconds
+    }
+
+    private func beginLoading() {
+        // Redirects share the same deadline while the page remains continuously loading.
+        guard activeLoadID == nil, loadingTimeoutError == nil else { return }
+        let id = UUID()
+        activeLoadID = id
+        loading = true
+        let timeout = effectiveLoadingTimeout
+        let started = ProcessInfo.processInfo.systemUptime
+        loadingTimeoutTask = Task { [weak self] in
+            var remaining = timeout
+            do {
+                repeat {
+                    try await Task.sleep(nanoseconds: UInt64(min(remaining, 3_600) * 1_000_000_000))
+                    remaining = timeout - (ProcessInfo.processInfo.systemUptime - started)
+                } while remaining > 0
+            } catch { return }
+            guard let self, self.activeLoadID == id, self.loading else { return }
+            let error = PageLoadTimeout(seconds: timeout)
+            self.loadingTimeoutError = error
+            self.navigationError = error.localizedDescription
+            self.stopLoading()
+        }
+    }
+
+    private func finishLoading() {
+        loadingTimeoutTask?.cancel()
+        loadingTimeoutTask = nil
+        activeLoadID = nil
+        loading = false
+    }
+
+    func stopLoading() {
+        finishLoading()
+        retireNavigation()
+        webView.stopLoading()
+    }
+
+    private func retireNavigation() {
+        if let activeNavigation {
+            retiredNavigations.append(activeNavigation)
+            if retiredNavigations.count > 32 { retiredNavigations.removeFirst() }
+        }
+        activeNavigation = nil
+    }
+
+    @discardableResult
+    private func trackNavigation(_ navigation: WKNavigation?) -> Bool {
+        guard let navigation else { return true }
+        guard !retiredNavigations.contains(where: { $0 === navigation }) else { return false }
+        if activeNavigation !== navigation {
+            retireNavigation()
+            activeNavigation = navigation
+        }
+        return true
+    }
+
+    private func isCurrentNavigation(_ navigation: WKNavigation?) -> Bool {
+        navigation == nil || navigation === activeNavigation
     }
 
     private func configureHeaders(_ selected: RequestHeaderConfiguration) {
@@ -72,13 +145,21 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
     /// Rebuild the underlying WebView with an optional proxy. Call before each registration run.
     /// On macOS < 14 the proxy parameter is ignored (no-op proxy change, no store rebuild).
     func rebuildWebView(proxy: ProxyEntry? = nil) {
+        finishLoading()
+        retireNavigation()
+        documentID = UUID().uuidString
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "beauty")
+        webView.stopLoading()
         let wkConfig = WKWebViewConfiguration()
         if #available(macOS 14.0, *) {
             let store = WKWebsiteDataStore.nonPersistent()
             if let entry = proxy, let proxyCfg = ProxyManager.configuration(for: entry) {
                 store.proxyConfigurations = [proxyCfg]
             }
-            wkConfig.websiteDataStore = store        } else {
+            wkConfig.websiteDataStore = store
+        } else {
             wkConfig.websiteDataStore = .nonPersistent()
         }
         wkConfig.preferences.javaScriptCanOpenWindowsAutomatically = false
@@ -93,7 +174,7 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         webView = newView
         webViewID = UUID()  // signals SwiftUI to re-create EmbeddedBrowser
         appliedHeaders = nil; appliedHeaderMode = nil; currentUserAgent = ""
-        verification = nil; registration = nil; navigationError = nil; loading = false
+        verification = nil; registration = nil; navigationError = nil; loadingTimeoutError = nil; loading = false
     }
 
     private func addNetworkRecord(_ record: NetworkRecord) {
@@ -139,9 +220,12 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         loadFixture(html, baseURL: baseURL, headers: compatibilityHeaders ? RequestHeaderConfiguration() : .webKit)
     }
     func loadFixture(_ html: String, baseURL: URL, headers: RequestHeaderConfiguration, prelude: String = "") {
+        stopLoading()
+        verification = nil; registration = nil; navigationError = nil; loadingTimeoutError = nil
         configureHeaders(headers)
         installBridge(prelude: prelude)
-        webView.loadHTMLString(html, baseURL: baseURL)
+        beginLoading()
+        trackNavigation(webView.loadHTMLString(html, baseURL: baseURL))
     }
     #endif
 
@@ -198,6 +282,7 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
               let value = message.body as? [String: Any],
               value["documentID"] as? String == documentID,
               let kind = value["kind"] as? String else { return }
+        if kind == "pageReady", navigationError == nil, loadingTimeoutError == nil { finishLoading() }
         if kind == "verification" { verification = value }
         if kind == "registration" { registration = value; onRegistration?(value) }
         if kind == "requestHeaders", allowedHost == "api.jiucaihezi.studio",
@@ -240,19 +325,44 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         if requestObservations.count > 20 { requestObservations.removeLast(requestObservations.count - 20) }
     }
 
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard webView === self.webView, trackNavigation(navigation) else { return }
+        beginLoading()
+    }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        loading = false
+        guard webView === self.webView, isCurrentNavigation(navigation) else { return }
+        finishLoading()
         Task { await refreshUserAgent() }
     }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failed(error) }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failed(error) }
-    private func failed(_ error: Error) {
-        loading = false
-        if (error as NSError).code != NSURLErrorCancelled { navigationError = "网页加载失败，请检查网络后重新打开。" }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard webView === self.webView, isCurrentNavigation(navigation) else { return }
+        failed(error)
     }
-    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { navigationError = "网页进程已退出，请停止任务并核对结果后重试。" }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard webView === self.webView, isCurrentNavigation(navigation) else { return }
+        failed(error)
+    }
+    private func failed(_ error: Error) {
+        // Cancellation of a replaced request can arrive after the next load has started.
+        guard (error as NSError).code != NSURLErrorCancelled else { return }
+        if (error as NSError).code == NSURLErrorTimedOut {
+            let timeout = PageLoadTimeout(seconds: effectiveLoadingTimeout)
+            loadingTimeoutError = timeout
+            navigationError = timeout.localizedDescription
+            finishLoading()
+            return
+        }
+        finishLoading()
+        navigationError = "网页加载失败：\(ProxyManager.networkFailureDescription(error))。"
+    }
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard webView === self.webView else { return }
+        finishLoading()
+        navigationError = "网页进程已退出。"
+    }
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard webView === self.webView else { decisionHandler(.cancel); return }
         guard let url = action.request.url else { decisionHandler(.cancel); return }
         if action.targetFrame?.isMainFrame == false { decisionHandler(.allow); return }
         if allowedHost == "api.jiucaihezi.studio", url.host == allowedHost,
@@ -273,6 +383,12 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         decisionHandler(.cancel)
     }
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        guard webView === self.webView else { decisionHandler(.cancel); return }
+        if navigationResponse.isForMainFrame,
+           let response = navigationResponse.response as? HTTPURLResponse,
+           response.url?.host == allowedHost, response.statusCode >= 400 {
+            navigationError = "网页无法访问（HTTP \(response.statusCode)）。"
+        }
         if allowedHost == "api.jiucaihezi.studio", navigationResponse.isForMainFrame,
            let response = navigationResponse.response as? HTTPURLResponse,
            let url = response.url, url.host == allowedHost {
@@ -291,6 +407,7 @@ final class BrowserPane: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         decisionHandler(.allow)
     }
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        guard webView === self.webView else { return nil }
         if let url = navigationAction.request.url, url.scheme == "https", navigationAction.navigationType == .linkActivated { NSWorkspace.shared.open(url) }
         return nil
     }

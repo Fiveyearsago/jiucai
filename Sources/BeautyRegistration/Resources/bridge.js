@@ -39,6 +39,13 @@
     if (el.disabled || el.getAttribute('aria-disabled') === 'true') return 'disabled';
     el.click(); return 'clicked';
   }
+  function registrationReadiness() {
+    if (location.hostname !== registrationHost || location.pathname !== '/sign-up') return false;
+    const fields = ['username', 'password', 'confirmPassword'].map(name => document.querySelector(`input[name="${name}"]`));
+    const email = document.querySelector('input[name="email"]');
+    if (email) fields.push(email);
+    return fields.every(el => visible(el) && !el.disabled);
+  }
   function mailboxReadiness() {
     const input = document.querySelector('#username');
     const domain = document.querySelector('[id^="headlessui-listbox-button"]')?.textContent.trim() || '';
@@ -109,6 +116,11 @@
       if (url.pathname === '/api/verification' && method === 'GET') kind = 'verification';
       if (kind) {
         const result = { kind, status, success: status >= 200 && status < 300 && body?.success === true, requestProfile };
+        if (kind === 'registration') {
+          result.rejected = !result.success &&
+            ((status >= 200 && status < 300 && body?.success === false) ||
+             (status >= 400 && status < 500 && status !== 408));
+        }
         if (!result.success) result.message = failureMessage(body);
         if (status === 429) {
           const seconds = retryAfterSeconds(retryAfter);
@@ -287,7 +299,7 @@
   }
   window.beautyBridge = {
     snapshot() {
-      const regReady = visible(document.querySelector('input[name="username"]')) && !!document.querySelector('input[name="confirmPassword"]');
+      const regReady = registrationReadiness();
       const mailbox = mailboxReadiness();
       return {...state, regReady, mailReady: mailbox.ready, mailStatus: mailbox.message, url: location.href, documentID: beautyDocumentID, requestProfile};
     },
@@ -358,4 +370,26 @@
     },
     submit() { return activate(document.querySelector('form button[type="submit"]')); }
   };
+
+  // The form can be usable before images, fonts or other subresources finish.
+  // Report readiness independently of the window load event, including SPA updates.
+  let readinessObserver;
+  let reportedReady = false;
+  function reportPageReady() {
+    if (reportedReady) return;
+    const page = window.beautyBridge.snapshot();
+    const ready = location.hostname === registrationHost ? page.regReady : page.mailReady;
+    if (!ready) return;
+    reportedReady = true;
+    readinessObserver?.disconnect();
+    emit({kind: 'pageReady'});
+  }
+  if (typeof MutationObserver !== 'undefined') {
+    readinessObserver = new MutationObserver(reportPageReady);
+    readinessObserver.observe(document, {childList: true, subtree: true, characterData: true, attributes: true,
+      attributeFilter: ['class', 'style', 'hidden', 'disabled', 'aria-disabled']});
+  }
+  document.addEventListener?.('DOMContentLoaded', reportPageReady, {once: true});
+  window.addEventListener?.('load', reportPageReady, {once: true});
+  reportPageReady();
 })();

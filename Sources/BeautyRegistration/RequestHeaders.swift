@@ -1,9 +1,10 @@
 import Foundation
 
 enum RequestHeaderMode: String, Codable, CaseIterable, Identifiable {
+    // Keep the persisted `webKit` value compatible with existing preferences.
     case safari, webKit
     var id: String { rawValue }
-    var title: String { self == .safari ? "Safari 兼容" : "默认 WebKit" }
+    var title: String { self == .safari ? "Safari 兼容" : "原生默认" }
     var userAgent: String? {
         guard self == .safari else { return nil }
         let version = Bundle(path: "/Applications/Safari.app")?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "26.0"
@@ -15,7 +16,7 @@ enum RequestLanguage: String, Codable, CaseIterable, Identifiable {
     case automatic, chinese, english
     var id: String { rawValue }
     var title: String {
-        switch self { case .automatic: return "网页 / 浏览器默认"; case .chinese: return "简体中文"; case .english: return "英文" }
+        switch self { case .automatic: return "系统默认"; case .chinese: return "简体中文"; case .english: return "英文" }
     }
     var value: String? {
         switch self { case .automatic: return nil; case .chinese: return "zh-CN,zh;q=0.9,en;q=0.8"; case .english: return "en-US,en;q=0.9" }
@@ -26,7 +27,7 @@ enum RequestAccept: String, Codable, CaseIterable, Identifiable {
     case automatic, json, general
     var id: String { rawValue }
     var title: String {
-        switch self { case .automatic: return "网页默认"; case .json: return "JSON"; case .general: return "JSON / 文本" }
+        switch self { case .automatic: return "原生默认"; case .json: return "JSON"; case .general: return "JSON / 文本" }
     }
     var value: String? {
         switch self { case .automatic: return nil; case .json: return "application/json"; case .general: return "application/json, text/plain, */*" }
@@ -81,7 +82,7 @@ enum HeaderVariantStrategy: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .fixed: return "不差异化"
         case .rotateLanguage: return "轮换语言偏好"
-        case .rotateUserAgent: return "轮换浏览器标识"
+        case .rotateUserAgent: return "轮换请求标识"
         case .rotateAll: return "语言 + 标识 全部轮换"
         }
     }

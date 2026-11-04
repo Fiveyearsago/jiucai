@@ -61,7 +61,7 @@ function fixture(host, {compatibility = false, overrides} = {}) {
     var xhr = new XMLHttpRequest();
     xhr.open(method || 'GET', url);
     xhr.send();
-    xhr.status = status || 200;
+    xhr.status = status ?? 200;
     xhr.retryAfter = retryAfter || null;
     xhr.responseText = typeof body === 'string' ? body : JSON.stringify(body);
     // getAllResponseHeaders stub for the response listener
@@ -77,6 +77,25 @@ function fixture(host, {compatibility = false, overrides} = {}) {
     get apiEvents() { return events.filter(e=>e.kind==='registration'||e.kind==='verification'); },
     get networkEvents() { return events.filter(e=>e.kind==='networkRecord'); }};
 }
+
+test('registration response distinguishes explicit rejection from an unknown submission outcome',()=>{
+  for (const [status, body, rejected] of [
+    [200, {success:false,message:'验证码错误'}, true],
+    [429, {message:'请求过多'}, true],
+    [0, {success:false}, false],
+    [408, {success:false}, false],
+    [502, '<html>Bad gateway</html>', false],
+    [500, {success:false,message:'Internal error'}, false],
+    [502, {success:false,message:'Bad gateway'}, false],
+    [503, {success:false,message:'Unavailable'}, false],
+    [200, '<html>Unexpected page</html>', false],
+    [200, {success:true}, false],
+  ]) {
+    const f=fixture('api.jiucaihezi.studio');
+    f.respond('/api/user/register', body, status, 'POST');
+    assert.equal(f.apiEvents.at(-1).rejected, rejected);
+  }
+});
 
 test('compatibility headers affect only registration API requests and preserve authentication and payload headers',async()=>{
   const f=fixture('api.jiucaihezi.studio',{compatibility:true});

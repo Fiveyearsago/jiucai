@@ -5,11 +5,77 @@ import RegistrationCore
 
 final class BrowserIntegrationTests: XCTestCase {
     @MainActor
+    func testReplacingProxyIgnoresFailuresFromPreviousWebView() {
+        let pane = BrowserPane(host: "api.jiucaihezi.studio")
+        let previous = pane.webView
+        pane.rebuildWebView()
+        pane.webView(previous, didFailProvisionalNavigation: nil, withError: URLError(.cannotConnectToHost))
+        XCTAssertNil(pane.navigationError, "A discarded proxy must not fail the new page")
+        pane.webView(pane.webView, didFailProvisionalNavigation: nil, withError: URLError(.cannotConnectToHost))
+        XCTAssertNotNil(pane.navigationError)
+    }
+
+    @MainActor
+    func testWebKitFailureSwitchesProxyAndRegistersSameAccountInFreshPage() async throws {
+        let pane = BrowserPane(host: "api.jiucaihezi.studio")
+        var configuration = ProxyConfiguration()
+        configuration.enabled = true
+        configuration.entries = (0..<2).map { ProxyEntry(host: "fixture\($0).invalid", port: 1080) }
+        let record = AccountRecord(username: "fixture176", email: "fixture176@test.invalid")
+        var tested: [UUID] = []
+        var attempts: [UUID] = []
+        var usernames: [String] = []
+        var failures = 0
+        try await RegistrationRetry.run(selectProxy: { previous, excluded in
+            let selection = try await ProxyManager.selectProxy(configuration: configuration, completedCount: 0,
+                                                               startingAfter: previous, excluding: excluded, test: { entry in
+                tested.append(entry.id)
+                return ProxyManager.TestResult(verdict: .usable, status: 200, milliseconds: 100, exit: nil, error: nil)
+            }, discard: { _, _ in XCTFail("Both fixture proxies pass preflight") })
+            return selection?.entry
+        }, attempt: { proxy in
+            attempts.append(try XCTUnwrap(proxy).id)
+            // Local HTML only: no connection is made to the proxy or registration service.
+            pane.rebuildWebView()
+            pane.loadFixture("""
+            <html><body><input name="username"><input name="password"><input name="confirmPassword"></body></html>
+            """, baseURL: URL(string: "https://api.jiucaihezi.studio/sign-up")!)
+            for _ in 0..<100 {
+                if await pane.snapshot()["regReady"] as? Bool == true { break }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            _ = try await pane.call("fillRegistration", arguments: ["username": record.username, "email": record.email, "password": "fixture-only-password"])
+            let username = try await pane.webView.evaluateJavaScript("document.querySelector('input[name=username]').value") as? String
+            usernames.append(try XCTUnwrap(username))
+            if attempts.count == 1 {
+                pane.webView(pane.webView, didFailProvisionalNavigation: nil, withError: URLError(.cannotConnectToHost))
+                throw ClientError.message(try XCTUnwrap(pane.navigationError))
+            }
+            XCTAssertNil(pane.navigationError)
+            _ = try await pane.webView.evaluateJavaScript("""
+            const xhr = new XMLHttpRequest(); xhr.open('POST', '/api/user/register');
+            Object.defineProperty(xhr, 'status', {value:200});
+            Object.defineProperty(xhr, 'responseText', {value:'{"success":true}'});
+            xhr.dispatchEvent(new Event('load'));
+            """)
+            for _ in 0..<100 {
+                if pane.registration != nil { break }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            XCTAssertEqual(pane.registration?["success"] as? Bool, true)
+        }, shouldRetry: { true }, onRetry: { _, _ in failures += 1 })
+        XCTAssertEqual(tested, configuration.entries.map(\.id))
+        XCTAssertEqual(attempts, tested)
+        XCTAssertEqual(usernames, [record.username, record.username])
+        XCTAssertEqual(failures, 1)
+    }
+
+    @MainActor
     func testHeaderChoicesAndSafeObservationsInRealWebKit() async throws {
         let pane = BrowserPane(host: "api.jiucaihezi.studio")
         let configuration = RequestHeaderConfiguration(mode: .webKit, language: .chinese, accept: .general)
         pane.loadFixture("""
-        <html><body><input name="username"><input name="confirmPassword"><script>
+        <html><body><input name="username"><input name="password"><input name="confirmPassword"><script>
         window.fixtureSend = () => {
           const xhr = new XMLHttpRequest(); xhr.open('POST', '/api/user/register?email=fixture@test.invalid&token=private-query');
           xhr.setRequestHeader('Accept', 'text/plain');
@@ -54,7 +120,7 @@ final class BrowserIntegrationTests: XCTestCase {
         let pane = BrowserPane(host: "api.jiucaihezi.studio")
         pane.webView.frame = CGRect(x: 0, y: 0, width: 900, height: 700)
         pane.loadFixture("""
-        <html><body><input name="username"><input name="confirmPassword">
+        <html><body><input name="username"><input name="password"><input name="confirmPassword">
         <button onclick="sendFixture()">发送验证码</button><script>
         window.sendTimes = [];
         function sendFixture() {
@@ -236,7 +302,7 @@ final class BrowserIntegrationTests: XCTestCase {
     func testReloadNeverReturnsReadyStateFromPreviousDocument() async throws {
         let pane = BrowserPane(host: "api.jiucaihezi.studio")
         pane.webView.frame = CGRect(x: 0, y: 0, width: 900, height: 700)
-        let html = "<html><body><input name='username'><input name='confirmPassword'></body></html>"
+        let html = "<html><body><input name='username'><input name='password'><input name='confirmPassword'></body></html>"
         let url = URL(string: "https://api.jiucaihezi.studio/sign-up")!
         pane.loadFixture(html, baseURL: url)
         var first: [String: Any] = [:]
