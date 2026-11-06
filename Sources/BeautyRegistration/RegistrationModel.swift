@@ -2,6 +2,10 @@ import AppKit
 import Combine
 import RegistrationCore
 
+enum RegistrationMethod {
+    case native, webpage
+}
+
 @MainActor
 final class RegistrationModel: ObservableObject {
     typealias TransportFactory = (ProxyEntry?, TimeInterval) throws -> NativeHTTPClient.Transport
@@ -43,6 +47,9 @@ final class RegistrationModel: ObservableObject {
     @Published var currentUsername = ""
     @Published var step = 0
     @Published var tab = "registration"
+    @Published var registrationMethod: RegistrationMethod = .native
+    @Published private(set) var activeRegistrationMethod: RegistrationMethod = .native
+    @Published private(set) var pagesOpened = false
     @Published var manualCode = ""
     @Published var formUsername = ""
     @Published var formEmail = ""
@@ -70,6 +77,29 @@ final class RegistrationModel: ObservableObject {
     }
 
     let networkMonitor = RequestMonitor()
+    private(set) lazy var registrationPage: BrowserPane = {
+        let pane = BrowserPane(host: "api.jiucaihezi.studio")
+        pane.onNetworkRecord = { [weak self] entry in
+            guard let self else { return }
+            self.networkMonitor.record(entry)
+            guard self.isRunning, self.activeRegistrationMethod == .webpage,
+                  let id = self.activeID, let index = self.records.firstIndex(where: { $0.id == id }) else { return }
+            self.records[index].network.append(entry)
+            if self.records[index].network.count > 100 { self.records[index].network.removeFirst() }
+            _ = self.persist()
+        }
+        pane.onRegistration = { [weak self] response in
+            guard let self, self.isRunning, self.activeRegistrationMethod == .webpage,
+                  self.submissionAttempted, let id = self.activeID,
+                  response["success"] as? Bool == true,
+                  let status = response["status"] as? Int, (200..<300).contains(status) else { return }
+            self.update(id, status: .succeeded, note: "网站注册接口已明确返回成功。")
+        }
+        return pane
+    }()
+    private(set) lazy var mailboxPage = BrowserPane(host: "fviainboxes.com")
+    // Tests can supply local WebKit pages without contacting either service.
+    var browserPageLoader: ((BrowserPane, URL, RequestHeaderConfiguration) -> Void)?
     let store: JournalStore
     private let transportFactory: TransportFactory?
     private let poolProxyTest: ProxyTest
@@ -266,7 +296,7 @@ final class RegistrationModel: ObservableObject {
         _ = persist()
     }
 
-    func start() {
+    func start(method: RegistrationMethod = .native) {
         guard !isRunning, !isCheckingConnection, storageAvailable else { return }
         do { try configuration.validate(password: password); try validateRun() }
         catch { alert = safeError(error); return }
@@ -278,10 +308,10 @@ final class RegistrationModel: ObservableObject {
         let batch = RegistrationBatch(configuration: config, records: records)
         guard batch.count > 0 else { alert = "这些用户名已有成功或待核对记录，请调整起始编号。"; return }
         guard persist() else { return }
-        beginRun(manual: false, count: batch.count)
+        beginRun(manual: false, count: batch.count, method: method)
         let generator = HeaderVariantGenerator(strategy: headerVariantStrategy, base: headerConfiguration)
         if !batch.blockedIndices.isEmpty { log("跳过 \(batch.blockedIndices.count) 个已成功或待核对账号。") }
-        log("开始原生接口注册，共 \(batch.count) 个账号。")
+        log("开始\(method == .webpage ? "网页" : "原生接口")注册，共 \(batch.count) 个账号。")
         let proxyTestsToDrain = proxyTestTask
         proxyTestsToDrain?.cancel()
         task = Task {
@@ -364,9 +394,11 @@ final class RegistrationModel: ObservableObject {
         submitRequested = true
     }
 
-    private func beginRun(manual: Bool, count: Int) {
+    private func beginRun(manual: Bool, count: Int, method: RegistrationMethod = .native) {
         persistenceError = nil
         isRunning = true; isPaused = false; isManualFlow = manual
+        activeRegistrationMethod = method; registrationMethod = method
+        if pagesOpened { registrationPage.stopLoading(); mailboxPage.stopLoading() }
         proxyNetworkScheduler.setRegistrationConcurrency(proxyConfiguration.sourceConfiguration.registrationConcurrency)
         completedInRun = 0; totalInRun = count
         waitingForCode = false; verificationSent = false; submitRequested = false
@@ -434,7 +466,11 @@ final class RegistrationModel: ObservableObject {
             activeProxyDescription = proxy?.displayName ?? "直接连接"
             update(record.id, status: .running, note: "正在连接注册接口。")
             do {
-                try await register(record, password: password, invitation: invitation, headers: headers, proxy: proxy)
+                if activeRegistrationMethod == .webpage {
+                    try await registerInBrowser(record, password: password, invitation: invitation, headers: headers, proxy: proxy)
+                } else {
+                    try await register(record, password: password, invitation: invitation, headers: headers, proxy: proxy)
+                }
                 try await gate()
                 if let proxy {
                     accountsWithCurrentProxy += 1
@@ -625,6 +661,7 @@ final class RegistrationModel: ObservableObject {
     func stop() {
         task?.cancel(); connectionTask?.cancel()
         activeSessions.forEach { $0.invalidateAndCancel() }
+        if pagesOpened { registrationPage.stopLoading(); mailboxPage.stopLoading() }
         isPaused = false
         detail = "正在停止。已提交的请求仍可能在服务器完成。"
     }
@@ -670,6 +707,168 @@ final class RegistrationModel: ObservableObject {
         guard !isRunning, records.first(where: {$0.id == id})?.status == .uncertain else { return }
         update(id, status: exists ? .succeeded : .failed,
                note: exists ? "用户已在官网核对：账号注册成功。" : "用户已在官网核对：账号未注册，允许重新创建任务。")
+    }
+}
+
+extension RegistrationModel {
+    func openPages() {
+        guard !isRunning, !isCheckingConnection else { return }
+        do {
+            try validateRun()
+            let proxy = try ProxyManager.selectProxy(configuration: proxyConfiguration, completedCount: completedInRun)
+            prepareBrowserPages(proxy: proxy, headers: headerConfiguration)
+            loadBrowserPage(registrationPage, url: configuration.registrationURL, headers: headerConfiguration)
+            loadBrowserPage(mailboxPage, url: URL(string: "https://fviainboxes.com")!, headers: .webKit)
+        } catch { alert = safeError(error) }
+    }
+
+    private func prepareBrowserPages(proxy: ProxyEntry?, headers: RequestHeaderConfiguration) {
+        registrationPage.rebuildWebView(proxy: proxy)
+        mailboxPage.rebuildWebView(proxy: proxy)
+        registrationPage.loadingTimeout = TimeInterval(proxyConfiguration.pageLoadingTimeoutSeconds)
+        mailboxPage.loadingTimeout = TimeInterval(proxyConfiguration.pageLoadingTimeoutSeconds)
+        activeProxyDescription = proxy?.displayName ?? "直接连接"
+        networkMonitor.configure(headers)
+        pagesOpened = true
+    }
+
+    private func loadBrowserPage(_ pane: BrowserPane, url: URL, headers: RequestHeaderConfiguration) {
+        if let browserPageLoader { browserPageLoader(pane, url, headers) }
+        else { pane.load(url, headers: headers) }
+    }
+
+    private func registerInBrowser(_ record: AccountRecord, password: String, invitation: String,
+                                   headers: RequestHeaderConfiguration, proxy: ProxyEntry?) async throws {
+        defer { waitingForCode = false }
+        prepareBrowserPages(proxy: proxy, headers: headers)
+        var config = configuration; config.invitation = invitation
+        step = 1; phase = "打开注册网页"; detail = "正在载入官网注册页面。"; tab = "registration"
+        appendLog(record.id, "开始网页注册流程。")
+        loadBrowserPage(registrationPage, url: config.registrationURL, headers: headers)
+        try await waitForBrowser(pane: registrationPage, message: "注册页面尚未就绪，请检查网页。") {
+            await self.registrationPage.snapshot()["regReady"] as? Bool == true
+        }
+        try await gate()
+        let filled = try await registrationPage.call("fillRegistration", arguments: [
+            "username": record.username, "email": record.email, "password": password
+        ]) as? [String: Any]
+        codeRequired = filled?["requiresEmail"] as? Bool == true
+        if codeRequired && autoReadMailbox {
+            step = 2; phase = "准备网页邮箱"; detail = "正在载入邮箱页面。"; tab = "mailbox"
+            loadBrowserPage(mailboxPage, url: URL(string: "https://fviainboxes.com")!, headers: .webKit)
+            try await waitForBrowser(pane: mailboxPage, message: "邮箱页面尚未就绪，请检查邮箱域名或网页验证。") {
+                let state = await self.mailboxPage.snapshot()
+                if let status = state["mailStatus"] as? String, !status.isEmpty { self.detail = status }
+                return state["mailReady"] as? Bool == true
+            }
+            try await gate()
+            guard try await mailboxPage.call("prepareMailbox", arguments: ["username": record.username]) as? String == "prepared" else {
+                throw ClientError.message("邮箱尚未准备完成，请检查邮箱页。")
+            }
+            _ = try await mailboxPage.call("armMailbox")
+        }
+        if codeRequired {
+            step = 3; phase = "发送网页验证码"; detail = "正在通过官网发送验证邮件。"; tab = "registration"
+            try await VerificationRetry.send(retryRateLimits: !proxyConfiguration.enabled, attempt: {
+                try await self.gate()
+                self.registrationPage.verification = nil
+                try await self.clickBrowserButton("sendCode", message: "请在注册页完成人机验证或检查邮箱字段，然后点击继续任务。")
+                try await self.waitForBrowser(pane: self.registrationPage, message: "发送验证码的结果未确认，请检查官网提示。") {
+                    self.registrationPage.verification != nil
+                }
+                let result = self.registrationPage.verification ?? [:]
+                self.appendLog(record.id, "网页发送验证码 → HTTP \(result["status"] as? Int ?? 0)")
+                return result
+            }, wait: { seconds, retry in
+                self.phase = "等待发送冷却"
+                for remaining in (1...seconds).reversed() {
+                    self.detail = "发送过于频繁，\(remaining) 秒后重试（\(retry)/\(VerificationRetry.maximumRetries)）。"
+                    try await self.tick()
+                }
+            })
+            verificationSent = true; waitingForCode = true
+            phase = "等待邮件验证码"
+            detail = autoReadMailbox ? "正在读取网页邮箱，也可以手动填写验证码。" : "请查看邮箱并在上方手动填写验证码。"
+            if autoReadMailbox {
+                tab = "mailbox"
+                _ = try await mailboxPage.call("beginMailboxPolling")
+            }
+            while !validCode(manualCode) {
+                try await gate()
+                if autoReadMailbox {
+                    if let error = mailboxPage.navigationError { throw ClientError.message(error) }
+                    _ = try await mailboxPage.call("pollMailbox")
+                    let state = await mailboxPage.snapshot()
+                    if let problem = state["problem"] as? String, !problem.isEmpty {
+                        try await browserAttention(problem + " 完成后点击继续任务。", tab: "mailbox")
+                        _ = try await mailboxPage.call("beginMailboxPolling")
+                    }
+                    if !validCode(manualCode), let code = state["code"] as? String, validCode(code) { manualCode = code }
+                }
+                if !validCode(manualCode) { try await tick(nanoseconds: 200_000_000) }
+            }
+            try await gate()
+            _ = try await registrationPage.call("fillCode", arguments: ["code": manualCode])
+            appendLog(record.id, "已填入网页验证码。")
+            manualCode = ""; waitingForCode = false
+        }
+        step = 4; phase = "提交网页注册"; detail = "等待网站返回明确结果。"; tab = "registration"
+        while true {
+            try await gate()
+            // Persist before clicking submit; a timeout or crash must never repeat an unknown POST.
+            submissionAttempted = true
+            update(record.id, status: .submitting, note: "准备通过网页提交，等待网站回执。")
+            if let persistenceError {
+                submissionAttempted = false
+                update(record.id, status: .running, note: "本地记录暂不可写，尚未提交网页注册。")
+                throw ClientError.message(persistenceError)
+            }
+            if try await registrationPage.call("submit") as? String == "clicked" { break }
+            submissionAttempted = false
+            update(record.id, status: .running, note: "等待用户完成网页验证或条款确认。")
+            try await browserAttention("请在注册页阅读并确认网站条款、完成人机验证，然后点击继续任务。", tab: "registration")
+        }
+        try await waitForBrowser(pane: registrationPage, message: "提交后未收到明确回执，请在官网核对账号。") {
+            self.registrationPage.registration != nil
+        }
+        let result = registrationPage.registration ?? [:]
+        if result["success"] as? Bool == true, let status = result["status"] as? Int, (200..<300).contains(status) {
+            update(record.id, status: .succeeded, note: "网站注册接口已明确返回成功。")
+            appendLog(record.id, "网页提交结果 → HTTP \(status) 注册成功。")
+            log("\(record.username)：网页注册成功。")
+            step = 5; phase = "保存结果"
+        } else {
+            submissionAttempted = result["rejected"] as? Bool != true
+            throw ClientError.message(ServerFailure.describe(result, operation: "网页注册"))
+        }
+    }
+
+    private func waitForBrowser(pane: BrowserPane, message: String,
+                                condition: () async throws -> Bool) async throws {
+        var remaining = TimeInterval(proxyConfiguration.pageLoadingTimeoutSeconds)
+        while true {
+            try await gate()
+            if try await condition() { return }
+            if let error = pane.navigationError { throw ClientError.message(error) }
+            guard remaining > 0 else { throw ClientError.message(message) }
+            let interval = min(remaining, 0.2)
+            try await tick(nanoseconds: UInt64(interval * 1_000_000_000))
+            remaining -= interval
+        }
+    }
+
+    private func clickBrowserButton(_ method: String, message: String) async throws {
+        while true {
+            try await gate()
+            if try await registrationPage.call(method) as? String == "clicked" { return }
+            try await browserAttention(message, tab: "registration")
+        }
+    }
+
+    private func browserAttention(_ message: String, tab: String) async throws {
+        self.tab = tab; phase = "等待网页操作"; detail = message; isPaused = true
+        log(message)
+        try await gate()
     }
 }
 

@@ -21,7 +21,8 @@ struct ContentView: View {
                 case "records": records
                 case "network": NetworkInspectorView(monitor: model.networkMonitor)
                 case "proxy": ProxyConfigurationView(model: model)
-                default: workspace
+                case "browser": workspace(web: true)
+                default: workspace()
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -50,6 +51,7 @@ struct ContentView: View {
             }.padding(.top, 28)
             VStack(spacing: 5) {
                 nav("workspace", "注册工作台", "rectangle.split.2x1")
+                nav("browser", "网页注册", "globe")
                 nav("records", "注册记录", "tray.full", count: model.records.count)
                 nav("network", "网络请求", "network", count: model.networkMonitor.networkRecords.count)
                 nav("proxy", "代理池", "arrow.triangle.2.circlepath", count: model.proxyConfiguration.activeEntries.count)
@@ -98,8 +100,15 @@ struct ContentView: View {
                         Button("停止") { model.stop() }.controlSize(.large)
                     }
                 } else {
-                    Button { section = "workspace"; model.start() } label: {
-                        HStack { Image(systemName: "play.fill"); Text("开始批量注册"); Spacer(); Image(systemName: "arrow.right") }.padding(.vertical, 4)
+                    Button {
+                        section = model.registrationMethod == .webpage ? "browser" : "workspace"
+                        model.start(method: model.registrationMethod)
+                    } label: {
+                        HStack {
+                            Image(systemName: "play.fill")
+                            Text(model.registrationMethod == .webpage ? "开始网页批量注册" : "开始批量注册")
+                            Spacer(); Image(systemName: "arrow.right")
+                        }.padding(.vertical, 4)
                     }.buttonStyle(.borderedProminent).controlSize(.large).disabled(!model.storageAvailable)
                 }
                 if model.isRunning {
@@ -125,7 +134,13 @@ struct ContentView: View {
         }
     }
     private func nav(_ key: String, _ title: String, _ symbol: String, count: Int? = nil) -> some View {
-        Button { section = key } label: {
+        Button {
+            section = key
+            if !model.isRunning {
+                if key == "browser" { model.registrationMethod = .webpage }
+                if key == "workspace" { model.registrationMethod = .native }
+            }
+        } label: {
             HStack(spacing: 10) {
                 Image(systemName: symbol).frame(width: 19)
                 Text(title).font(.system(size: 13, weight: section == key ? .semibold : .regular))
@@ -151,14 +166,15 @@ struct ContentView: View {
         }.padding(.horizontal, 28).padding(.top, 38).padding(.bottom, 24)
     }
 
-    private var workspace: some View {
+    private func workspace(web: Bool = false) -> some View {
         VStack(spacing: 18) {
             HStack(spacing: 12) {
                 metric("本次进度", value: "\(model.completedInRun) / \(model.totalInRun)", symbol: "circle.dotted")
                 metric("已成功", value: "\(model.successCount)", symbol: "checkmark.circle")
                 metric("待核对", value: "\(model.uncertainCount)", symbol: "clock.badge.questionmark")
             }
-            nativeRegistrationArea
+            if web { BrowserRegistrationArea(model: model) }
+            else { nativeRegistrationArea }
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: "text.alignleft").foregroundStyle(accent)
                 VStack(alignment: .leading, spacing: 5) {
@@ -367,6 +383,102 @@ struct ContentView: View {
             Text("记录与导出文件包含用户名、邮箱和状态，不包含密码或验证码。网络详情不含 Cookie、Authorization、查询参数和请求正文。")
                 .font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
         }.padding(.horizontal, 28).padding(.bottom, 26)
+    }
+}
+
+private struct BrowserRegistrationArea: View {
+    @ObservedObject var model: RegistrationModel
+    private var nativeTaskRunning: Bool { model.isRunning && model.activeRegistrationMethod == .native }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("网页注册").font(.system(size: 22, weight: .semibold))
+                    Text("通过官网填写信息、接收验证码并注册，网页验证可直接在下方完成。")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle("自动读取邮箱验证码", isOn: $model.autoReadMailbox)
+                    .toggleStyle(.checkbox).font(.system(size: 11)).disabled(model.isRunning)
+            }.padding(18)
+            Divider()
+            HStack(spacing: 12) {
+                Picker("网页", selection: $model.tab) {
+                    Text("注册页面").tag("registration")
+                    Text("邮箱收件箱").tag("mailbox")
+                }.pickerStyle(.segmented).frame(width: 220)
+                Spacer(minLength: 0)
+                Text(model.tab == "registration" ? "api.jiucaihezi.studio" : "fviainboxes.com")
+                    .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                Button { model.openPages() } label: { Label("重新载入", systemImage: "arrow.clockwise") }
+                    .disabled(model.isRunning || model.isCheckingConnection)
+            }.padding(12)
+            if model.isRunning && model.activeRegistrationMethod == .webpage {
+                HStack(spacing: 12) {
+                    Text(model.phase).fontWeight(.medium)
+                    Text(model.detail).foregroundStyle(.secondary).textSelection(.enabled)
+                    Spacer(minLength: 0)
+                    if model.waitingForCode {
+                        TextField("手动输入 6 位验证码", text: $model.manualCode)
+                            .textFieldStyle(.roundedBorder).frame(width: 170)
+                    }
+                    if model.isPaused { Button("继续任务") { model.togglePause() } }
+                }.font(.system(size: 12)).padding(12).background(accent.opacity(0.06))
+            }
+            Divider()
+            ZStack {
+                if model.pagesOpened {
+                    BrowserSurface(pane: model.registrationPage)
+                        .opacity(model.tab == "registration" ? 1 : 0)
+                        .allowsHitTesting(model.tab == "registration" && !nativeTaskRunning)
+                        .accessibilityHidden(model.tab != "registration")
+                    BrowserSurface(pane: model.mailboxPage)
+                        .opacity(model.tab == "mailbox" ? 1 : 0)
+                        .allowsHitTesting(model.tab == "mailbox" && !nativeTaskRunning)
+                        .accessibilityHidden(model.tab != "mailbox")
+                } else {
+                    VStack(spacing: 15) {
+                        Image(systemName: "globe").font(.system(size: 40, weight: .ultraLight)).foregroundStyle(accent)
+                        Text("注册与收信，在一个窗口完成").font(.system(size: 17, weight: .medium))
+                        Text("打开网页手动操作，或使用左侧「开始网页批量注册」自动填写并注册。")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
+                        Button("打开注册页和邮箱") { model.openPages() }.controlSize(.large)
+                            .disabled(model.isRunning || model.isCheckingConnection)
+                        Text("手动网页操作不会自动创建本地账号记录。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                if nativeTaskRunning {
+                    Text("原生注册任务正在运行，结束后可使用网页注册。")
+                        .font(.system(size: 14)).frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(.regularMaterial)
+                }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack {
+                Label(model.pagesOpened ? model.activeProxyDescription : "打开网页时应用当前代理设置", systemImage: "network")
+                Spacer()
+                Text("自动任务结果保存在「注册记录」")
+            }.font(.system(size: 11)).foregroundStyle(.secondary).padding(12)
+        }.background(.white).clipShape(RoundedRectangle(cornerRadius: 13))
+            .overlay(RoundedRectangle(cornerRadius: 13).stroke(ink.opacity(0.08), lineWidth: 1))
+    }
+}
+
+private struct BrowserSurface: View {
+    @ObservedObject var pane: BrowserPane
+    var body: some View {
+        ZStack(alignment: .top) {
+            EmbeddedBrowser(pane: pane).id(pane.webViewID)
+            if pane.loading {
+                HStack(spacing: 8) { ProgressView().controlSize(.small); Text("正在加载网页…").font(.caption) }
+                    .padding(10).background(.regularMaterial, in: Capsule()).padding(.top, 12)
+            }
+            if let error = pane.navigationError {
+                Text(error).font(.caption).padding(12).frame(maxWidth: .infinity)
+                    .background(Color.orange.opacity(0.14))
+            }
+        }
     }
 }
 
@@ -819,6 +931,18 @@ private struct ProxyConfigurationView: View {
                         } else {
                             Button("全部测试") { model.testProxies(model.proxyConfiguration.entries) }
                                 .disabled(model.proxyConfiguration.entries.isEmpty || proxyControlsLocked || model.proxyLatencyError != nil)
+                        }
+                        if !model.proxyTestResults.isEmpty {
+                            let unreachableCount = model.proxyConfiguration.entries.filter { entry in
+                                model.proxyTestResults[entry.id]?.verdict == .unreachable
+                            }.count
+                            if unreachableCount > 0 {
+                                Button("移除不通 (\(unreachableCount))") {
+                                    model.proxyConfiguration.entries.removeAll { entry in
+                                        model.proxyTestResults[entry.id]?.verdict == .unreachable
+                                    }
+                                }.foregroundStyle(.red.opacity(0.8)).disabled(proxyControlsLocked)
+                            }
                         }
                     }
                     Text("默认同时测试 \(ProxyManager.defaultBatchConcurrency) 个，最多 \(ProxyManager.maximumBatchConcurrency) 个；其余排队，排队时间不计入延时，网络较慢时可调为 1 个。测试超过 \(model.proxyConfiguration.poolTestLimitMilliseconds) ms 或不可用的代理会自动删除。")
