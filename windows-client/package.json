@@ -1,0 +1,39 @@
+{
+  "name": "beauty-registration-windows",
+  "version": "0.2.0-preview.1",
+  "description": "Beauty 注册助手 Windows 客户端",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "package:win": "electron-builder --win zip --x64"
+  },
+  "dependencies": {
+    "socks-proxy-agent": "10.1.0"
+  },
+  "devDependencies": {
+    "electron": "45.2.2",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "studio.beauty.registration",
+    "productName": "Beauty 注册助手",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "README.md"
+    ],
+    "win": {
+      "target": [
+        "zip"
+      ],
+      "artifactName": "Beauty-Registration-Win11-x64-${version}.${ext}",
+      "signAndEditExecutable": false
+    }
+  }
+}
